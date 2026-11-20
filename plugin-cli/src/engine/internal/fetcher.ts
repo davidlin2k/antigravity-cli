@@ -1,23 +1,18 @@
-import { execFile } from "node:child_process";
-import crypto from "node:crypto";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
 import {
   joinAbsolutePath,
-  makeAbsolutePath,
   makeDiagnosticId,
   makeIsoTimestamp,
 } from "../../domain/types.ts";
 import type {
   AbsolutePath,
+  CatalogEntry,
   Diagnostic,
+  ManifestEcosystem,
   MarketplaceId,
   MarketplaceSource,
   ParsedMarketplaceInput,
-  PluginInstallSource,
-  RelativeSubpath,
   WorkspacePaths,
 } from "../../domain/types.ts";
 import type { MarketplaceSyncOutcome } from "../contract.ts";
@@ -26,6 +21,13 @@ import {
   normalizeMarketplaceRoot,
 } from "./catalog.ts";
 import { errorMessage, isRecord } from "./fs-safety.ts";
+import {
+  DEFAULT_NETWORK_TIMEOUT_MS,
+  cloneOrUpdateGitMirror,
+  isBareGitRepo,
+  isInsideCanonicalDir,
+  runGit,
+} from "./git.ts";
 import { parseJsoncBomSafe } from "./jsonc.ts";
 import {
   loadSyncCache,
@@ -34,71 +36,6 @@ import {
   syncCachePath,
 } from "./stores.ts";
 import type { KnownMarketplaceEntry, PersistedSyncCache } from "./stores.ts";
-
-const execFileAsync = promisify(execFile);
-
-export const DEFAULT_NETWORK_TIMEOUT_MS = 30_000;
-
-interface GitRunResult {
-  readonly ok: boolean;
-  readonly stdout: string;
-  readonly stderr: string;
-  readonly message: string;
-}
-
-async function runGit(
-  args: readonly string[],
-  options?: {
-    readonly cwd?: AbsolutePath | string;
-    readonly timeoutMs?: number;
-  },
-): Promise<GitRunResult> {
-  const timeout = options?.timeoutMs ?? DEFAULT_NETWORK_TIMEOUT_MS;
-  try {
-    const { stdout, stderr } = await execFileAsync("git", [...args], {
-      cwd: options?.cwd,
-      timeout,
-      maxBuffer: 16 * 1024 * 1024,
-      env: {
-        ...process.env,
-        GIT_TERMINAL_PROMPT: "0",
-        GIT_ASKPASS: "echo",
-        GCM_INTERACTIVE: "never",
-      },
-    });
-    return { ok: true, stdout, stderr, message: "" };
-  } catch (err) {
-    const stderr =
-      isRecord(err) && typeof err.stderr === "string" ? err.stderr.trim() : "";
-    const stdout =
-      isRecord(err) && typeof err.stdout === "string" ? err.stdout.trim() : "";
-    const msg = stderr.length > 0 ? stderr : errorMessage(err);
-    return { ok: false, stdout, stderr, message: msg };
-  }
-}
-
-async function isBareGitRepo(dirPath: AbsolutePath): Promise<boolean> {
-  try {
-    const headStat = await fs.stat(path.join(dirPath, "HEAD"));
-    const objectsStat = await fs.stat(path.join(dirPath, "objects"));
-    if (!headStat.isFile() || !objectsStat.isDirectory()) {
-      return false;
-    }
-    const dotGitExists = await fs
-      .lstat(path.join(dirPath, ".git"))
-      .then(() => true)
-      .catch(() => false);
-    if (dotGitExists) {
-      return false;
-    }
-    const check = await runGit(["-C", dirPath, "rev-parse", "--is-bare-repository"], {
-      timeoutMs: 5_000,
-    });
-    return check.ok && check.stdout.trim() === "true";
-  } catch {
-    return false;
-  }
-}
 
 export async function resolveMarketplaceSource(
   input: ParsedMarketplaceInput,
@@ -159,114 +96,6 @@ export async function resolveMarketplaceSource(
       reason: `Failed to probe "${input.url}": ${errorMessage(err)}`,
     };
   }
-}
-
-async function isInsideCanonicalDir(candidate: string, canonicalBase: string): Promise<boolean> {
-  try {
-    const resolved = await fs.realpath(candidate);
-    return resolved === canonicalBase || resolved.startsWith(`${canonicalBase}${path.sep}`);
-  } catch {
-    return false;
-  }
-}
-
-async function cloneOrUpdateGitMirror(input: {
-  readonly remoteUrl: string;
-  readonly mirrorDir: AbsolutePath;
-  readonly ref?: string;
-  readonly isLocalRepo: boolean;
-  readonly timeoutMs: number;
-}): Promise<
-  | { readonly ok: true; readonly resolvedRef: string | null; readonly resolvedSha: string | null }
-  | { readonly ok: false; readonly reason: string }
-> {
-  const { remoteUrl, mirrorDir, ref, isLocalRepo, timeoutMs } = input;
-  const dotGitDir = path.join(mirrorDir, ".git");
-  const mirrorExists = await fs
-    .stat(dotGitDir)
-    .then((s) => s.isDirectory())
-    .catch(() => false);
-
-  if (!mirrorExists) {
-    await fs.rm(mirrorDir, { recursive: true, force: true }).catch(() => {});
-    await fs.mkdir(path.dirname(mirrorDir), { recursive: true });
-
-    const cloneArgs: string[] = ["clone"];
-    if (!isLocalRepo) {
-      cloneArgs.push("--depth", "1");
-    }
-    if (ref !== undefined) {
-      cloneArgs.push("--branch", ref);
-    }
-    cloneArgs.push("--", remoteUrl, mirrorDir);
-
-    let cloned = await runGit(cloneArgs, { timeoutMs });
-    if (!cloned.ok && ref !== undefined) {
-      await fs.rm(mirrorDir, { recursive: true, force: true }).catch(() => {});
-      cloned = await runGit(["clone", "--", remoteUrl, mirrorDir], { timeoutMs });
-      if (cloned.ok) {
-        const co = await runGit(["checkout", "--force", ref], { cwd: mirrorDir, timeoutMs });
-        if (!co.ok) {
-          return { ok: false, reason: `git checkout ${ref} failed: ${co.message}` };
-        }
-      }
-    }
-    if (!cloned.ok) {
-      return { ok: false, reason: `git clone failed: ${cloned.message}` };
-    }
-  } else {
-    const fetchTarget = ref ?? "HEAD";
-    const fetchArgs = isLocalRepo
-      ? ["fetch", "origin", fetchTarget]
-      : ["fetch", "--depth", "1", "origin", fetchTarget];
-    let fetched = await runGit(fetchArgs, { cwd: mirrorDir, timeoutMs });
-    if (!fetched.ok && !isLocalRepo) {
-      fetched = await runGit(["fetch", "origin", fetchTarget], { cwd: mirrorDir, timeoutMs });
-    }
-    if (!fetched.ok) {
-      fetched = await runGit(["fetch", "--prune", "origin"], { cwd: mirrorDir, timeoutMs });
-      if (!fetched.ok) {
-        return { ok: false, reason: `git fetch failed: ${fetched.message}` };
-      }
-      if (ref !== undefined) {
-        const co = await runGit(["checkout", "--force", ref], { cwd: mirrorDir, timeoutMs });
-        if (!co.ok) {
-          return { ok: false, reason: `git checkout ${ref} failed: ${co.message}` };
-        }
-      }
-    } else {
-      const reset = await runGit(["reset", "--hard", "FETCH_HEAD"], { cwd: mirrorDir, timeoutMs });
-      if (!reset.ok) {
-        return { ok: false, reason: `git reset failed: ${reset.message}` };
-      }
-    }
-    await runGit(["clean", "-fd"], { cwd: mirrorDir, timeoutMs });
-  }
-
-  const shaRes = await runGit(["rev-parse", "HEAD"], { cwd: mirrorDir, timeoutMs: 5_000 });
-  const resolvedSha = shaRes.ok ? shaRes.stdout.trim() || null : null;
-
-  let resolvedRef: string | null = ref ?? null;
-  if (resolvedRef === null) {
-    const sym = await runGit(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], {
-      cwd: mirrorDir,
-      timeoutMs: 5_000,
-    });
-    if (sym.ok) {
-      const raw = sym.stdout.trim();
-      resolvedRef = raw.startsWith("origin/") ? raw.slice("origin/".length) : raw || null;
-    } else {
-      const branch = await runGit(["rev-parse", "--abbrev-ref", "HEAD"], {
-        cwd: mirrorDir,
-        timeoutMs: 5_000,
-      });
-      if (branch.ok && branch.stdout.trim() !== "HEAD") {
-        resolvedRef = branch.stdout.trim() || null;
-      }
-    }
-  }
-
-  return { ok: true, resolvedRef, resolvedSha };
 }
 
 function buildSyncFailedDiagnostic(
@@ -346,6 +175,42 @@ async function persistSyncFailure(input: {
   };
 }
 
+async function persistSyncSuccess(input: {
+  readonly paths: WorkspacePaths;
+  readonly marketplaceId: MarketplaceId;
+  readonly format: ManifestEcosystem;
+  readonly entries: readonly CatalogEntry[];
+  readonly diagnostics: readonly Diagnostic[];
+  readonly resolvedRef: string | null;
+  readonly resolvedSha: string | null;
+  readonly localMirrorPath: AbsolutePath | null;
+  readonly sourceMtimeMs: number | null;
+}): Promise<MarketplaceSyncOutcome> {
+  const cache: PersistedSyncCache = {
+    schemaVersion: 1,
+    marketplaceId: input.marketplaceId,
+    sync: {
+      kind: "synced",
+      syncedAt: makeIsoTimestamp(),
+      resolvedRef: input.resolvedRef,
+      resolvedSha: input.resolvedSha,
+      format: input.format,
+      pluginCount: input.entries.length,
+    },
+    localMirrorPath: input.localMirrorPath,
+    sourceMtimeMs: input.sourceMtimeMs,
+    entries: input.entries,
+    diagnostics: input.diagnostics,
+  };
+  await saveSyncCache(input.paths, cache);
+  return {
+    marketplaceId: input.marketplaceId,
+    status: "synced",
+    pluginCount: input.entries.length,
+    format: input.format,
+  };
+}
+
 export async function syncSingleMarketplace(
   paths: WorkspacePaths,
   entry: KnownMarketplaceEntry,
@@ -404,29 +269,17 @@ export async function syncSingleMarketplace(
             extraDiagnostics: normalized.diagnostics,
           });
         }
-        const cache: PersistedSyncCache = {
-          schemaVersion: 1,
+        return persistSyncSuccess({
+          paths,
           marketplaceId: entry.id,
-          sync: {
-            kind: "synced",
-            syncedAt: makeIsoTimestamp(),
-            resolvedRef: synced.resolvedRef,
-            resolvedSha: synced.resolvedSha,
-            format: normalized.format,
-            pluginCount: normalized.entries.length,
-          },
-          localMirrorPath: mirrorDir,
-          sourceMtimeMs: null,
+          format: normalized.format,
           entries: normalized.entries,
           diagnostics: normalized.diagnostics,
-        };
-        await saveSyncCache(paths, cache);
-        return {
-          marketplaceId: entry.id,
-          status: "synced",
-          pluginCount: normalized.entries.length,
-          format: normalized.format,
-        };
+          resolvedRef: synced.resolvedRef,
+          resolvedSha: synced.resolvedSha,
+          localMirrorPath: mirrorDir,
+          sourceMtimeMs: null,
+        });
       }
 
       case "local-folder": {
@@ -478,29 +331,17 @@ export async function syncSingleMarketplace(
               extraDiagnostics: normalized.diagnostics,
             });
           }
-          const cache: PersistedSyncCache = {
-            schemaVersion: 1,
+          return persistSyncSuccess({
+            paths,
             marketplaceId: entry.id,
-            sync: {
-              kind: "synced",
-              syncedAt: makeIsoTimestamp(),
-              resolvedRef: synced.resolvedRef,
-              resolvedSha: synced.resolvedSha,
-              format: normalized.format,
-              pluginCount: normalized.entries.length,
-            },
-            localMirrorPath: mirrorDir,
-            sourceMtimeMs: dirStat.mtimeMs,
+            format: normalized.format,
             entries: normalized.entries,
             diagnostics: normalized.diagnostics,
-          };
-          await saveSyncCache(paths, cache);
-          return {
-            marketplaceId: entry.id,
-            status: "synced",
-            pluginCount: normalized.entries.length,
-            format: normalized.format,
-          };
+            resolvedRef: synced.resolvedRef,
+            resolvedSha: synced.resolvedSha,
+            localMirrorPath: mirrorDir,
+            sourceMtimeMs: dirStat.mtimeMs,
+          });
         }
 
         let resolvedSha: string | null = null;
@@ -539,29 +380,17 @@ export async function syncSingleMarketplace(
           });
         }
 
-        const cache: PersistedSyncCache = {
-          schemaVersion: 1,
+        return persistSyncSuccess({
+          paths,
           marketplaceId: entry.id,
-          sync: {
-            kind: "synced",
-            syncedAt: makeIsoTimestamp(),
-            resolvedRef,
-            resolvedSha,
-            format: normalized.format,
-            pluginCount: normalized.entries.length,
-          },
-          localMirrorPath: null,
-          sourceMtimeMs: dirStat.mtimeMs,
+          format: normalized.format,
           entries: normalized.entries,
           diagnostics: normalized.diagnostics,
-        };
-        await saveSyncCache(paths, cache);
-        return {
-          marketplaceId: entry.id,
-          status: "synced",
-          pluginCount: normalized.entries.length,
-          format: normalized.format,
-        };
+          resolvedRef,
+          resolvedSha,
+          localMirrorPath: null,
+          sourceMtimeMs: dirStat.mtimeMs,
+        });
       }
 
       case "local-json": {
@@ -590,29 +419,17 @@ export async function syncSingleMarketplace(
             extraDiagnostics: normalized.diagnostics,
           });
         }
-        const cache: PersistedSyncCache = {
-          schemaVersion: 1,
+        return persistSyncSuccess({
+          paths,
           marketplaceId: entry.id,
-          sync: {
-            kind: "synced",
-            syncedAt: makeIsoTimestamp(),
-            resolvedRef: null,
-            resolvedSha: null,
-            format: normalized.format,
-            pluginCount: normalized.entries.length,
-          },
-          localMirrorPath: null,
-          sourceMtimeMs: stat.mtimeMs,
+          format: normalized.format,
           entries: normalized.entries,
           diagnostics: normalized.diagnostics,
-        };
-        await saveSyncCache(paths, cache);
-        return {
-          marketplaceId: entry.id,
-          status: "synced",
-          pluginCount: normalized.entries.length,
-          format: normalized.format,
-        };
+          resolvedRef: null,
+          resolvedSha: null,
+          localMirrorPath: null,
+          sourceMtimeMs: stat.mtimeMs,
+        });
       }
 
       case "https-json": {
@@ -655,29 +472,17 @@ export async function syncSingleMarketplace(
             extraDiagnostics: normalized.diagnostics,
           });
         }
-        const cache: PersistedSyncCache = {
-          schemaVersion: 1,
+        return persistSyncSuccess({
+          paths,
           marketplaceId: entry.id,
-          sync: {
-            kind: "synced",
-            syncedAt: makeIsoTimestamp(),
-            resolvedRef: null,
-            resolvedSha: null,
-            format: normalized.format,
-            pluginCount: normalized.entries.length,
-          },
-          localMirrorPath: null,
-          sourceMtimeMs: null,
+          format: normalized.format,
           entries: normalized.entries,
           diagnostics: normalized.diagnostics,
-        };
-        await saveSyncCache(paths, cache);
-        return {
-          marketplaceId: entry.id,
-          status: "synced",
-          pluginCount: normalized.entries.length,
-          format: normalized.format,
-        };
+          resolvedRef: null,
+          resolvedSha: null,
+          localMirrorPath: null,
+          sourceMtimeMs: null,
+        });
       }
 
       default: {
@@ -692,340 +497,5 @@ export async function syncSingleMarketplace(
       previous,
       reason: errorMessage(err),
     });
-  }
-}
-
-interface MaterializedBundle {
-  readonly sourceDir: AbsolutePath;
-  readonly resolvedSha: string | null;
-  readonly cleanup: () => Promise<void>;
-}
-
-type MaterializeResult =
-  | { readonly ok: true; readonly bundle: MaterializedBundle }
-  | { readonly ok: false; readonly kind: "path-traversal"; readonly offendingPath: string }
-  | { readonly ok: false; readonly kind: "io-failed"; readonly operation: string; readonly reason: string };
-
-async function cloneGitIntoTempDir(input: {
-  readonly repoUrl: string;
-  readonly ref?: string;
-  readonly sha?: string;
-  readonly subdir?: RelativeSubpath;
-  readonly isLocalRepo?: boolean;
-  readonly timeoutMs: number;
-}): Promise<MaterializeResult> {
-  const tmpDir = makeAbsolutePath(await fs.mkdtemp(path.join(os.tmpdir(), "agy-plugin-fetch-")));
-  const cleanup = async (): Promise<void> => {
-    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
-  };
-
-  try {
-    const cloneArgs: string[] = ["clone"];
-    if (!input.isLocalRepo && input.sha === undefined) {
-      cloneArgs.push("--depth", "1");
-    }
-    if (input.ref !== undefined && input.sha === undefined) {
-      cloneArgs.push("--branch", input.ref);
-    }
-    cloneArgs.push("--", input.repoUrl, tmpDir);
-
-    let cloned = await runGit(cloneArgs, { timeoutMs: input.timeoutMs });
-    if (!cloned.ok && input.ref !== undefined && input.sha === undefined) {
-      await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
-      await fs.mkdir(tmpDir, { recursive: true });
-      cloned = await runGit(["clone", "--", input.repoUrl, tmpDir], {
-        timeoutMs: input.timeoutMs,
-      });
-      if (cloned.ok) {
-        const co = await runGit(["checkout", "--force", input.ref], {
-          cwd: tmpDir,
-          timeoutMs: input.timeoutMs,
-        });
-        if (!co.ok) {
-          await cleanup();
-          return {
-            ok: false,
-            kind: "io-failed",
-            operation: "git-checkout",
-            reason: co.message,
-          };
-        }
-      }
-    }
-    if (!cloned.ok) {
-      await cleanup();
-      return {
-        ok: false,
-        kind: "io-failed",
-        operation: "git-clone",
-        reason: cloned.message,
-      };
-    }
-
-    if (input.sha !== undefined) {
-      const co = await runGit(["checkout", "--force", input.sha], {
-        cwd: tmpDir,
-        timeoutMs: input.timeoutMs,
-      });
-      if (!co.ok) {
-        await cleanup();
-        return {
-          ok: false,
-          kind: "io-failed",
-          operation: "git-checkout",
-          reason: `Could not check out commit ${input.sha}: ${co.message}`,
-        };
-      }
-    }
-
-    const shaRes = await runGit(["rev-parse", "HEAD"], { cwd: tmpDir, timeoutMs: 5_000 });
-    const resolvedSha = shaRes.ok ? shaRes.stdout.trim() || null : null;
-
-    let sourceDir = tmpDir;
-    if (input.subdir !== undefined) {
-      sourceDir = joinAbsolutePath(tmpDir, input.subdir);
-      const canonicalTmp = await fs.realpath(tmpDir);
-      if (!(await isInsideCanonicalDir(sourceDir, canonicalTmp))) {
-        await cleanup();
-        return { ok: false, kind: "path-traversal", offendingPath: input.subdir };
-      }
-      const stat = await fs.stat(sourceDir).catch(() => null);
-      if (stat === null || !stat.isDirectory()) {
-        await cleanup();
-        return {
-          ok: false,
-          kind: "io-failed",
-          operation: "materialize-subdir",
-          reason: `Subdirectory "${input.subdir}" does not exist in "${input.repoUrl}".`,
-        };
-      }
-    }
-
-    return {
-      ok: true,
-      bundle: { sourceDir, resolvedSha, cleanup },
-    };
-  } catch (err) {
-    await cleanup();
-    return {
-      ok: false,
-      kind: "io-failed",
-      operation: "materialize-git",
-      reason: errorMessage(err),
-    };
-  }
-}
-
-export async function materializeInstallSource(input: {
-  readonly installSource: PluginInstallSource;
-  readonly paths: WorkspacePaths;
-  readonly marketplaces: readonly KnownMarketplaceEntry[];
-  readonly syncCaches: ReadonlyMap<MarketplaceId, PersistedSyncCache>;
-  readonly timeoutMs?: number;
-}): Promise<MaterializeResult> {
-  const timeoutMs = input.timeoutMs ?? DEFAULT_NETWORK_TIMEOUT_MS;
-  const { installSource } = input;
-
-  switch (installSource.kind) {
-    case "marketplace-root":
-    case "marketplace-subdir": {
-      const opName =
-        installSource.kind === "marketplace-root"
-          ? "materialize-marketplace-root"
-          : "materialize-marketplace-subdir";
-      const mkt = input.marketplaces.find((m) => m.id === installSource.marketplaceId);
-      const cache = input.syncCaches.get(installSource.marketplaceId) ?? null;
-
-      let baseDir: AbsolutePath | null = cache?.localMirrorPath ?? null;
-      if (baseDir === null && mkt?.source.kind === "local-folder") {
-        baseDir = mkt.source.path;
-      }
-      if (baseDir === null) {
-        return {
-          ok: false,
-          kind: "io-failed",
-          operation: opName,
-          reason: `Marketplace "${installSource.marketplaceId}" has no local mirror or folder on disk. Run marketplace update first.`,
-        };
-      }
-
-      let effectiveBase = baseDir;
-      if (
-        mkt !== undefined &&
-        (mkt.source.kind === "github" ||
-          mkt.source.kind === "ssh" ||
-          mkt.source.kind === "https-git") &&
-        mkt.source.subdir !== undefined
-      ) {
-        effectiveBase = joinAbsolutePath(baseDir, mkt.source.subdir);
-        let canonicalMirror: string;
-        try {
-          canonicalMirror = await fs.realpath(baseDir);
-        } catch (err) {
-          return {
-            ok: false,
-            kind: "io-failed",
-            operation: opName,
-            reason: errorMessage(err),
-          };
-        }
-        if (!(await isInsideCanonicalDir(effectiveBase, canonicalMirror))) {
-          return { ok: false, kind: "path-traversal", offendingPath: mkt.source.subdir };
-        }
-      }
-
-      const sourceDir =
-        installSource.kind === "marketplace-root"
-          ? effectiveBase
-          : joinAbsolutePath(effectiveBase, installSource.subdir);
-      if (installSource.kind === "marketplace-subdir") {
-        let canonicalBase: string;
-        try {
-          canonicalBase = await fs.realpath(effectiveBase);
-        } catch (err) {
-          return {
-            ok: false,
-            kind: "io-failed",
-            operation: opName,
-            reason: errorMessage(err),
-          };
-        }
-        if (!(await isInsideCanonicalDir(sourceDir, canonicalBase))) {
-          return { ok: false, kind: "path-traversal", offendingPath: installSource.subdir };
-        }
-      }
-
-      const stat = await fs.stat(sourceDir).catch(() => null);
-      if (stat === null || !stat.isDirectory()) {
-        return {
-          ok: false,
-          kind: "io-failed",
-          operation: opName,
-          reason:
-            installSource.kind === "marketplace-root"
-              ? `Marketplace root directory not found for "${installSource.marketplaceId}".`
-              : `Plugin directory "${installSource.subdir}" not found in marketplace "${installSource.marketplaceId}".`,
-        };
-      }
-      const resolvedSha =
-        cache !== null && cache.sync.kind === "synced" ? cache.sync.resolvedSha : null;
-      return {
-        ok: true,
-        bundle: {
-          sourceDir,
-          resolvedSha,
-          cleanup: async () => {},
-        },
-      };
-    }
-
-    case "local-dir": {
-      const stat = await fs.stat(installSource.path).catch(() => null);
-      if (stat === null || !stat.isDirectory()) {
-        return {
-          ok: false,
-          kind: "io-failed",
-          operation: "materialize-local-dir",
-          reason: `Local plugin directory "${installSource.path}" does not exist.`,
-        };
-      }
-      if (await isBareGitRepo(installSource.path)) {
-        return cloneGitIntoTempDir({
-          repoUrl: installSource.path,
-          isLocalRepo: true,
-          timeoutMs,
-        });
-      }
-      return {
-        ok: true,
-        bundle: {
-          sourceDir: installSource.path,
-          resolvedSha: null,
-          cleanup: async () => {},
-        },
-      };
-    }
-
-    case "git-repo":
-      return cloneGitIntoTempDir({
-        repoUrl: installSource.repoUrl,
-        ref: installSource.ref,
-        sha: installSource.sha,
-        timeoutMs,
-      });
-
-    case "git-subdir":
-      return cloneGitIntoTempDir({
-        repoUrl: installSource.repoUrl,
-        ref: installSource.ref,
-        sha: installSource.sha,
-        subdir: installSource.subdir,
-        timeoutMs,
-      });
-
-    case "archive-url": {
-      const tmpDir = makeAbsolutePath(
-        await fs.mkdtemp(path.join(os.tmpdir(), "agy-plugin-archive-")),
-      );
-      const cleanup = async (): Promise<void> => {
-        await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
-      };
-      try {
-        const res = await fetch(installSource.url, {
-          signal: AbortSignal.timeout(timeoutMs),
-        });
-        if (!res.ok) {
-          await cleanup();
-          return {
-            ok: false,
-            kind: "io-failed",
-            operation: "fetch-archive",
-            reason: `HTTP ${res.status} downloading "${installSource.url}".`,
-          };
-        }
-        const bytes = new Uint8Array(await res.arrayBuffer());
-        if (installSource.sha256 !== undefined) {
-          const digest = crypto.createHash("sha256").update(bytes).digest("hex");
-          if (digest !== installSource.sha256.toLowerCase()) {
-            await cleanup();
-            return {
-              ok: false,
-              kind: "io-failed",
-              operation: "verify-archive",
-              reason: `Archive SHA-256 mismatch: expected ${installSource.sha256}, got ${digest}.`,
-            };
-          }
-        }
-        const archivePath = path.join(tmpDir, "bundle.tar.gz");
-        const extractDir = makeAbsolutePath(path.join(tmpDir, "extracted"));
-        await fs.writeFile(archivePath, bytes);
-        await fs.mkdir(extractDir, { recursive: true });
-        await execFileAsync("tar", ["-xzf", archivePath, "-C", extractDir], {
-          timeout: timeoutMs,
-        });
-        const entries = await fs.readdir(extractDir, { withFileTypes: true });
-        let sourceDir = extractDir;
-        if (entries.length === 1 && entries[0]?.isDirectory()) {
-          sourceDir = makeAbsolutePath(path.join(extractDir, entries[0].name));
-        }
-        return {
-          ok: true,
-          bundle: { sourceDir, resolvedSha: null, cleanup },
-        };
-      } catch (err) {
-        await cleanup();
-        return {
-          ok: false,
-          kind: "io-failed",
-          operation: "extract-archive",
-          reason: errorMessage(err),
-        };
-      }
-    }
-
-    default: {
-      const _exhaustive: never = installSource;
-      return _exhaustive;
-    }
   }
 }

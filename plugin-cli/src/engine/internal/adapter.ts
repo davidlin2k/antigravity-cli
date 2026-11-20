@@ -20,13 +20,18 @@ import type {
   PluginDirName,
 } from "../../domain/types.ts";
 import {
+  atomicSwapStagingDir,
+  copyDirectorySafely,
+  expandPluginRootInValue,
+  fileExists,
+  removeCaseVariantRootManifest,
+} from "./adapter-copy.ts";
+import {
   BACKUP_PREFIX,
   STAGING_PREFIX,
   checkContainedPath,
   errorMessage,
   isRecord,
-  isWithinCanonicalRoot,
-  resolvePossiblyDanglingTarget,
   writeJsonAtomic,
 } from "./fs-safety.ts";
 import { inspectPluginDirectory } from "./inspector.ts";
@@ -46,6 +51,12 @@ interface AdaptInstallInput {
   readonly disabled?: boolean;
 }
 
+type BundleInvalidError = {
+  readonly ok: false;
+  readonly kind: "bundle-invalid";
+  readonly diagnostics: NonEmpty<Diagnostic>;
+};
+
 type AdaptInstallResult =
   | {
       readonly ok: true;
@@ -57,172 +68,87 @@ type AdaptInstallResult =
       readonly warnings: readonly Diagnostic[];
     }
   | { readonly ok: false; readonly kind: "path-traversal"; readonly offendingPath: string }
-  | { readonly ok: false; readonly kind: "bundle-invalid"; readonly diagnostics: NonEmpty<Diagnostic> }
-  | { readonly ok: false; readonly kind: "io-failed"; readonly operation: string; readonly reason: string };
+  | BundleInvalidError
+  | {
+      readonly ok: false;
+      readonly kind: "io-failed";
+      readonly operation: string;
+      readonly reason: string;
+    };
 
 type ToggleManifestResult =
   | { readonly ok: true; readonly outcome: "changed" | "unchanged" }
   | { readonly ok: false; readonly kind: "path-traversal"; readonly offendingPath: string }
-  | { readonly ok: false; readonly kind: "bundle-invalid"; readonly diagnostics: NonEmpty<Diagnostic> }
-  | { readonly ok: false; readonly kind: "io-failed"; readonly operation: string; readonly reason: string };
-
-const PLUGIN_ROOT_REPLACE_RE = /\$\{(?:CLAUDE_PLUGIN_ROOT|PLUGIN_ROOT)\}/g;
-
-function expandPluginRootInValue(
-  value: unknown,
-  finalInstallPath: AbsolutePath,
-): { readonly value: unknown; readonly expanded: boolean } {
-  if (typeof value === "string") {
-    PLUGIN_ROOT_REPLACE_RE.lastIndex = 0;
-    if (!PLUGIN_ROOT_REPLACE_RE.test(value)) {
-      return { value, expanded: false };
-    }
-    PLUGIN_ROOT_REPLACE_RE.lastIndex = 0;
-    return {
-      value: value.replace(PLUGIN_ROOT_REPLACE_RE, finalInstallPath),
-      expanded: true,
+  | BundleInvalidError
+  | {
+      readonly ok: false;
+      readonly kind: "io-failed";
+      readonly operation: string;
+      readonly reason: string;
     };
-  }
-  if (Array.isArray(value)) {
-    let expanded = false;
-    const out: unknown[] = new Array(value.length);
-    for (let i = 0; i < value.length; i += 1) {
-      const item = expandPluginRootInValue(value[i], finalInstallPath);
-      out[i] = item.value;
-      if (item.expanded) {
-        expanded = true;
-      }
-    }
-    return { value: out, expanded };
-  }
-  if (isRecord(value)) {
-    let expanded = false;
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value)) {
-      const child = expandPluginRootInValue(v, finalInstallPath);
-      out[k] = child.value;
-      if (child.expanded) {
-        expanded = true;
-      }
-    }
-    return { value: out, expanded };
-  }
-  return { value, expanded: false };
+
+function bundleSyntaxError(
+  pluginId: InstalledPluginId,
+  idSuffix: string,
+  filePath: AbsolutePath,
+  parsed: {
+    readonly line: number | null;
+    readonly column: number | null;
+    readonly hadUtf8Bom: boolean;
+    readonly syntaxError: string;
+  },
+  message: string,
+  hint: string,
+): BundleInvalidError {
+  return {
+    ok: false,
+    kind: "bundle-invalid",
+    diagnostics: [
+      {
+        id: makeDiagnosticId("manifest-json-syntax", pluginId, idSuffix),
+        severity: "error",
+        subject: { kind: "installed", pluginId },
+        detail: {
+          kind: "manifest-json-syntax",
+          filePath,
+          line: parsed.line,
+          column: parsed.column,
+          hadUtf8Bom: parsed.hadUtf8Bom,
+          syntaxError: parsed.syntaxError,
+        },
+        message,
+        hint,
+      },
+    ],
+  };
 }
 
-async function copyDirectorySafely(input: {
-  readonly currentSrc: AbsolutePath;
-  readonly currentDest: AbsolutePath;
-  readonly canonicalSourceRoot: string;
-  readonly relPrefix: string;
-  readonly ancestorRealDirs: ReadonlySet<string>;
-}): Promise<
-  | { readonly ok: true }
-  | { readonly ok: false; readonly kind: "path-traversal"; readonly offendingPath: string }
-> {
-  await fs.mkdir(input.currentDest, { recursive: true });
-  const entries = await fs.readdir(input.currentSrc, { withFileTypes: true });
-
-  for (const entry of entries) {
-    if (entry.name === ".git" && input.relPrefix === "") {
-      continue;
-    }
-    if (entry.name === ".." || entry.name === "." || entry.name.includes("\0")) {
-      return { ok: false, kind: "path-traversal", offendingPath: entry.name };
-    }
-    const relPath = input.relPrefix.length > 0 ? `${input.relPrefix}/${entry.name}` : entry.name;
-    const srcPath = makeAbsolutePath(path.join(input.currentSrc, entry.name));
-    const destPath = makeAbsolutePath(path.join(input.currentDest, entry.name));
-
-    const lstat = await fs.lstat(srcPath);
-    if (lstat.isSymbolicLink()) {
-      let resolved: string;
-      let targetStat: Awaited<ReturnType<typeof fs.stat>> | null = null;
-      try {
-        resolved = await fs.realpath(srcPath);
-        targetStat = await fs.stat(srcPath);
-      } catch {
-        const rawLink = await fs.readlink(srcPath);
-        resolved = await resolvePossiblyDanglingTarget(input.currentSrc, rawLink);
-      }
-      if (!isWithinCanonicalRoot(resolved, input.canonicalSourceRoot)) {
-        return { ok: false, kind: "path-traversal", offendingPath: relPath };
-      }
-      if (targetStat === null) {
-        continue;
-      }
-      if (targetStat.isDirectory()) {
-        if (!input.ancestorRealDirs.has(resolved)) {
-          const nextAncestors = new Set(input.ancestorRealDirs);
-          nextAncestors.add(resolved);
-          const nested = await copyDirectorySafely({
-            currentSrc: makeAbsolutePath(resolved),
-            currentDest: destPath,
-            canonicalSourceRoot: input.canonicalSourceRoot,
-            relPrefix: relPath,
-            ancestorRealDirs: nextAncestors,
-          });
-          if (!nested.ok) {
-            return nested;
-          }
-        }
-      } else if (targetStat.isFile()) {
-        await fs.copyFile(resolved, destPath);
-        const execBits = targetStat.mode & 0o111;
-        if (execBits !== 0) {
-          await fs.chmod(destPath, 0o644 | execBits).catch(() => {});
-        }
-      }
-      continue;
-    }
-
-    if (lstat.isDirectory()) {
-      const realDir = await fs.realpath(srcPath);
-      if (!isWithinCanonicalRoot(realDir, input.canonicalSourceRoot)) {
-        return { ok: false, kind: "path-traversal", offendingPath: relPath };
-      }
-      if (!input.ancestorRealDirs.has(realDir)) {
-        const nextAncestors = new Set(input.ancestorRealDirs);
-        nextAncestors.add(realDir);
-        const nested = await copyDirectorySafely({
-          currentSrc: makeAbsolutePath(realDir),
-          currentDest: destPath,
-          canonicalSourceRoot: input.canonicalSourceRoot,
-          relPrefix: relPath,
-          ancestorRealDirs: nextAncestors,
-        });
-        if (!nested.ok) {
-          return nested;
-        }
-      }
-    } else if (lstat.isFile()) {
-      await fs.copyFile(srcPath, destPath);
-      const execBits = lstat.mode & 0o111;
-      if (execBits !== 0) {
-        await fs.chmod(destPath, 0o644 | execBits).catch(() => {});
-      }
-    }
-  }
-
-  return { ok: true };
-}
-
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    const stat = await fs.stat(filePath);
-    return stat.isFile();
-  } catch {
-    return false;
-  }
-}
-
-async function entryExists(targetPath: string): Promise<boolean> {
-  try {
-    await fs.lstat(targetPath);
-    return true;
-  } catch {
-    return false;
-  }
+function bundleSchemaError(
+  pluginId: InstalledPluginId,
+  idSuffix: string,
+  filePath: AbsolutePath,
+  fieldErrors: NonEmpty<string>,
+  message: string,
+  hint: string,
+): BundleInvalidError {
+  return {
+    ok: false,
+    kind: "bundle-invalid",
+    diagnostics: [
+      {
+        id: makeDiagnosticId("manifest-schema-invalid", pluginId, idSuffix),
+        severity: "error",
+        subject: { kind: "installed", pluginId },
+        detail: {
+          kind: "manifest-schema-invalid",
+          filePath,
+          fieldErrors,
+        },
+        message,
+        hint,
+      },
+    ],
+  };
 }
 
 export async function adaptAndInstallBundle(
@@ -259,51 +185,28 @@ export async function adaptAndInstallBundle(
     if (foundManifest === null) {
       await cleanupStage();
       const missingPath = joinAbsolutePath(stageDir, makeRelativeSubpath("plugin.json"));
-      return {
-        ok: false,
-        kind: "bundle-invalid",
-        diagnostics: [
-          {
-            id: makeDiagnosticId("manifest-schema-invalid", pluginId, "missing"),
-            severity: "error",
-            subject: { kind: "installed", pluginId },
-            detail: {
-              kind: "manifest-schema-invalid",
-              filePath: missingPath,
-              fieldErrors: ["Missing plugin.json manifest in source bundle."],
-            },
-            message: `Bundle for "${pluginId}" is missing a plugin.json manifest.`,
-            hint: "Ensure the plugin directory contains plugin.json (or .claude-plugin/plugin.json / .cursor-plugin/plugin.json).",
-          },
-        ],
-      };
+      return bundleSchemaError(
+        pluginId,
+        "missing",
+        missingPath,
+        ["Missing plugin.json manifest in source bundle."],
+        `Bundle for "${pluginId}" is missing a plugin.json manifest.`,
+        "Ensure the plugin directory contains plugin.json (or .claude-plugin/plugin.json / .cursor-plugin/plugin.json).",
+      );
     }
 
     const manifestBytes = await fs.readFile(foundManifest.path);
     const parsedManifest = parseJsoncBomSafe(manifestBytes, foundManifest.path);
     if (!parsedManifest.ok) {
       await cleanupStage();
-      return {
-        ok: false,
-        kind: "bundle-invalid",
-        diagnostics: [
-          {
-            id: makeDiagnosticId("manifest-json-syntax", pluginId, "plugin-json"),
-            severity: "error",
-            subject: { kind: "installed", pluginId },
-            detail: {
-              kind: "manifest-json-syntax",
-              filePath: foundManifest.path,
-              line: parsedManifest.line,
-              column: parsedManifest.column,
-              hadUtf8Bom: parsedManifest.hadUtf8Bom,
-              syntaxError: parsedManifest.syntaxError,
-            },
-            message: `Syntax error in ${foundManifest.relativePath}: ${parsedManifest.syntaxError}`,
-            hint: "Fix the JSON syntax error in the plugin manifest before installing.",
-          },
-        ],
-      };
+      return bundleSyntaxError(
+        pluginId,
+        "plugin-json",
+        foundManifest.path,
+        parsedManifest,
+        `Syntax error in ${foundManifest.relativePath}: ${parsedManifest.syntaxError}`,
+        "Fix the JSON syntax error in the plugin manifest before installing.",
+      );
     }
 
     const normalized = normalizeAntigravityManifest(
@@ -312,24 +215,14 @@ export async function adaptAndInstallBundle(
     );
     if (!normalized.ok) {
       await cleanupStage();
-      return {
-        ok: false,
-        kind: "bundle-invalid",
-        diagnostics: [
-          {
-            id: makeDiagnosticId("manifest-schema-invalid", pluginId, "plugin-json"),
-            severity: "error",
-            subject: { kind: "installed", pluginId },
-            detail: {
-              kind: "manifest-schema-invalid",
-              filePath: foundManifest.path,
-              fieldErrors: normalized.fieldErrors,
-            },
-            message: `Invalid ${foundManifest.relativePath}: ${normalized.fieldErrors.join(" ")}`,
-            hint: "Fix the manifest fields before installing.",
-          },
-        ],
-      };
+      return bundleSchemaError(
+        pluginId,
+        "plugin-json",
+        foundManifest.path,
+        normalized.fieldErrors,
+        `Invalid ${foundManifest.relativePath}: ${normalized.fieldErrors.join(" ")}`,
+        "Fix the manifest fields before installing.",
+      );
     }
 
     const effectiveVersion =
@@ -344,13 +237,7 @@ export async function adaptAndInstallBundle(
     };
 
     const rootManifestPath = joinAbsolutePath(stageDir, makeRelativeSubpath("plugin.json"));
-    if (
-      foundManifest.path !== rootManifestPath &&
-      path.dirname(foundManifest.path) === stageDir &&
-      path.basename(foundManifest.path).toLowerCase() === "plugin.json"
-    ) {
-      await fs.rm(foundManifest.path, { force: true });
-    }
+    await removeCaseVariantRootManifest(foundManifest.path, rootManifestPath, stageDir);
     await writeJsonAtomic(rootManifestPath, finalManifest, 0o644);
 
     let adaptedHooks = false;
@@ -389,27 +276,14 @@ export async function adaptAndInstallBundle(
       const parsedHooks = parseJsoncBomSafe(hooksBytes, hooksSourcePath);
       if (!parsedHooks.ok) {
         await cleanupStage();
-        return {
-          ok: false,
-          kind: "bundle-invalid",
-          diagnostics: [
-            {
-              id: makeDiagnosticId("manifest-json-syntax", pluginId, "hooks-json"),
-              severity: "error",
-              subject: { kind: "installed", pluginId },
-              detail: {
-                kind: "manifest-json-syntax",
-                filePath: hooksSourcePath,
-                line: parsedHooks.line,
-                column: parsedHooks.column,
-                hadUtf8Bom: parsedHooks.hadUtf8Bom,
-                syntaxError: parsedHooks.syntaxError,
-              },
-              message: `Syntax error in hooks configuration: ${parsedHooks.syntaxError}`,
-              hint: "Fix the JSON syntax error in hooks.json.",
-            },
-          ],
-        };
+        return bundleSyntaxError(
+          pluginId,
+          "hooks-json",
+          hooksSourcePath,
+          parsedHooks,
+          `Syntax error in hooks configuration: ${parsedHooks.syntaxError}`,
+          "Fix the JSON syntax error in hooks.json.",
+        );
       }
       if (!isRecord(parsedHooks.value)) {
         await cleanupStage();
@@ -434,7 +308,10 @@ export async function adaptAndInstallBundle(
       }
 
       const wasWrapped = isRecord(parsedHooks.value.hooks);
-      const unwrapped = wasWrapped && isRecord(parsedHooks.value.hooks) ? parsedHooks.value.hooks : parsedHooks.value;
+      const unwrapped =
+        wasWrapped && isRecord(parsedHooks.value.hooks)
+          ? parsedHooks.value.hooks
+          : parsedHooks.value;
       const expanded = expandPluginRootInValue(unwrapped, finalInstallPath);
       if (expanded.expanded) {
         expandedPluginRoot = true;
@@ -485,27 +362,14 @@ export async function adaptAndInstallBundle(
       const parsedMcp = parseJsoncBomSafe(mcpBytes, mcpSourcePath);
       if (!parsedMcp.ok) {
         await cleanupStage();
-        return {
-          ok: false,
-          kind: "bundle-invalid",
-          diagnostics: [
-            {
-              id: makeDiagnosticId("manifest-json-syntax", pluginId, "mcp-config"),
-              severity: "error",
-              subject: { kind: "installed", pluginId },
-              detail: {
-                kind: "manifest-json-syntax",
-                filePath: mcpSourcePath,
-                line: parsedMcp.line,
-                column: parsedMcp.column,
-                hadUtf8Bom: parsedMcp.hadUtf8Bom,
-                syntaxError: parsedMcp.syntaxError,
-              },
-              message: `Syntax error in MCP configuration: ${parsedMcp.syntaxError}`,
-              hint: "Fix the JSON syntax error in .mcp.json or mcp_config.json.",
-            },
-          ],
-        };
+        return bundleSyntaxError(
+          pluginId,
+          "mcp-config",
+          mcpSourcePath,
+          parsedMcp,
+          `Syntax error in MCP configuration: ${parsedMcp.syntaxError}`,
+          "Fix the JSON syntax error in .mcp.json or mcp_config.json.",
+        );
       }
       mcpHadBom = parsedMcp.hadUtf8Bom;
       rawMcpValue = parsedMcp.value;
@@ -534,9 +398,7 @@ export async function adaptAndInstallBundle(
         };
       }
       const normalizedMcpObj =
-        "mcpServers" in rawMcpValue
-          ? rawMcpValue
-          : { mcpServers: rawMcpValue };
+        "mcpServers" in rawMcpValue ? rawMcpValue : { mcpServers: rawMcpValue };
       const expanded = expandPluginRootInValue(normalizedMcpObj, finalInstallPath);
       if (expanded.expanded) {
         expandedPluginRoot = true;
@@ -558,50 +420,29 @@ export async function adaptAndInstallBundle(
     if (!inspection.valid || inspection.manifest === null) {
       await cleanupStage();
       const errors = inspection.diagnostics.filter((d) => d.severity === "error");
-      const reported = isNonEmpty(errors)
-        ? errors
-        : isNonEmpty(inspection.diagnostics)
-          ? inspection.diagnostics
-          : ([
-              {
-                id: makeDiagnosticId("manifest-schema-invalid", pluginId, "stage-failed"),
-                severity: "error",
-                subject: { kind: "installed", pluginId },
-                detail: {
-                  kind: "manifest-schema-invalid",
-                  filePath: rootManifestPath,
-                  fieldErrors: ["Staged bundle failed validation."],
-                },
-                message: `Staged bundle for "${pluginId}" failed validation.`,
-                hint: "Inspect bundle files and retry.",
-              },
-            ] satisfies NonEmpty<Diagnostic>);
-      return { ok: false, kind: "bundle-invalid", diagnostics: reported };
+      if (isNonEmpty(errors)) {
+        return { ok: false, kind: "bundle-invalid", diagnostics: errors };
+      }
+      if (isNonEmpty(inspection.diagnostics)) {
+        return { ok: false, kind: "bundle-invalid", diagnostics: inspection.diagnostics };
+      }
+      return bundleSchemaError(
+        pluginId,
+        "stage-failed",
+        rootManifestPath,
+        ["Staged bundle failed validation."],
+        `Staged bundle for "${pluginId}" failed validation.`,
+        "Inspect bundle files and retry.",
+      );
     }
 
-    const hadExisting = await entryExists(finalInstallPath);
-    let movedToBackup = false;
-    try {
-      if (hadExisting) {
-        await fs.rename(finalInstallPath, backupDir);
-        movedToBackup = true;
-      }
-      await fs.rename(stageDir, finalInstallPath);
-    } catch (swapErr) {
-      if (movedToBackup) {
-        await fs.rename(backupDir, finalInstallPath).catch(() => {});
-      }
-      await cleanupStage();
-      return {
-        ok: false,
-        kind: "io-failed",
-        operation: "atomic-swap",
-        reason: errorMessage(swapErr),
-      };
-    }
-
-    if (movedToBackup) {
-      await fs.rm(backupDir, { recursive: true, force: true }).catch(() => {});
+    const swapResult = await atomicSwapStagingDir({
+      stageDir,
+      finalInstallPath,
+      backupDir,
+    });
+    if (!swapResult.ok) {
+      return swapResult;
     }
 
     const warnings = inspection.diagnostics.filter((d) => d.severity === "warning");
@@ -665,24 +506,14 @@ export async function toggleManifestDisabledAtomic(
 
   const found = await findPluginManifestFile(installPath);
   if (found === null) {
-    return {
-      ok: false,
-      kind: "bundle-invalid",
-      diagnostics: [
-        {
-          id: makeDiagnosticId("manifest-schema-invalid", pluginId, "missing"),
-          severity: "error",
-          subject: { kind: "installed", pluginId },
-          detail: {
-            kind: "manifest-schema-invalid",
-            filePath: rootManifestPath,
-            fieldErrors: ["Missing plugin.json manifest."],
-          },
-          message: `Cannot toggle "${pluginId}": missing plugin.json.`,
-          hint: "Reinstall or repair plugin.json.",
-        },
-      ],
-    };
+    return bundleSchemaError(
+      pluginId,
+      "missing",
+      rootManifestPath,
+      ["Missing plugin.json manifest."],
+      `Cannot toggle "${pluginId}": missing plugin.json.`,
+      "Reinstall or repair plugin.json.",
+    );
   }
 
   const manifestCheck = await checkContainedPath(found.path, canonicalInstallRoot);
@@ -704,54 +535,35 @@ export async function toggleManifestDisabledAtomic(
 
   const parsed = parseJsoncBomSafe(rawBytes, found.path);
   if (!parsed.ok) {
-    return {
-      ok: false,
-      kind: "bundle-invalid",
-      diagnostics: [
-        {
-          id: makeDiagnosticId("manifest-json-syntax", pluginId, "plugin-json"),
-          severity: "error",
-          subject: { kind: "installed", pluginId },
-          detail: {
-            kind: "manifest-json-syntax",
-            filePath: found.path,
-            line: parsed.line,
-            column: parsed.column,
-            hadUtf8Bom: parsed.hadUtf8Bom,
-            syntaxError: parsed.syntaxError,
-          },
-          message: `Cannot toggle "${pluginId}": syntax error in plugin.json: ${parsed.syntaxError}`,
-          hint: "Fix the JSON syntax error in plugin.json.",
-        },
-      ],
-    };
+    return bundleSyntaxError(
+      pluginId,
+      "plugin-json",
+      found.path,
+      parsed,
+      `Cannot toggle "${pluginId}": syntax error in plugin.json: ${parsed.syntaxError}`,
+      "Fix the JSON syntax error in plugin.json.",
+    );
   }
 
   const normalized = normalizeAntigravityManifest(parsed.value);
   if (!normalized.ok || !isRecord(parsed.value)) {
-    return {
-      ok: false,
-      kind: "bundle-invalid",
-      diagnostics: [
-        {
-          id: makeDiagnosticId("manifest-schema-invalid", pluginId, "plugin-json"),
-          severity: "error",
-          subject: { kind: "installed", pluginId },
-          detail: {
-            kind: "manifest-schema-invalid",
-            filePath: found.path,
-            fieldErrors: normalized.ok ? ["Manifest root must be a JSON object."] : normalized.fieldErrors,
-          },
-          message: `Cannot toggle "${pluginId}": invalid plugin.json.`,
-          hint: "Fix the schema errors in plugin.json.",
-        },
-      ],
-    };
+    return bundleSchemaError(
+      pluginId,
+      "plugin-json",
+      found.path,
+      normalized.ok ? ["Manifest root must be a JSON object."] : normalized.fieldErrors,
+      `Cannot toggle "${pluginId}": invalid plugin.json.`,
+      "Fix the schema errors in plugin.json.",
+    );
   }
 
   const currentlyDisabled = normalized.manifest.disabled === true;
   const targetDisabled = !enabled;
-  if (currentlyDisabled === targetDisabled && found.path === rootManifestPath && !parsed.hadUtf8Bom) {
+  if (
+    currentlyDisabled === targetDisabled &&
+    found.path === rootManifestPath &&
+    !parsed.hadUtf8Bom
+  ) {
     return { ok: true, outcome: "unchanged" };
   }
 
@@ -767,13 +579,7 @@ export async function toggleManifestDisabledAtomic(
   }
 
   try {
-    if (
-      found.path !== rootManifestPath &&
-      path.dirname(found.path) === installPath &&
-      path.basename(found.path).toLowerCase() === "plugin.json"
-    ) {
-      await fs.rm(found.path, { force: true });
-    }
+    await removeCaseVariantRootManifest(found.path, rootManifestPath, installPath);
     await writeJsonAtomic(rootManifestPath, updated, 0o644);
     return { ok: true, outcome: "changed" };
   } catch (err) {
