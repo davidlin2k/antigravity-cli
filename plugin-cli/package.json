@@ -1,0 +1,30 @@
+{
+  "name": "@antigravity/plugin-cli",
+  "version": "0.1.0",
+  "description": "Local multi-marketplace plugin manager CLI and interactive TUI for Antigravity",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "bin": {
+    "agy-plugin": "./bin/agy-plugin.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./domain": "./src/domain/types.ts",
+    "./query": "./src/domain/query.ts",
+    "./engine": "./src/engine/index.ts",
+    "./cli": "./src/cli/index.ts",
+    "./tui": "./src/tui/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts",
+    "start": "node bin/agy-plugin.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.3"
+  }
+}
