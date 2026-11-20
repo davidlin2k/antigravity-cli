@@ -24,11 +24,10 @@ import type { MarketplaceSyncOutcome } from "../contract.ts";
 import {
   normalizeJsonCatalog,
   normalizeMarketplaceRoot,
-  parseJsoncBomSafe,
-} from "./normalizer.ts";
+} from "./catalog.ts";
+import { errorMessage, isRecord } from "./fs-safety.ts";
+import { parseJsoncBomSafe } from "./jsonc.ts";
 import {
-  errorMessage,
-  isRecord,
   loadSyncCache,
   marketplaceMirrorPath,
   saveSyncCache,

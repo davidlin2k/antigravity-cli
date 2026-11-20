@@ -19,12 +19,6 @@ import type {
   NormalizedPluginManifest,
   PluginDirName,
 } from "../../domain/types.ts";
-import { inspectPluginDirectory } from "./inspector.ts";
-import {
-  findPluginManifestFile,
-  normalizeAntigravityManifest,
-  parseJsoncBomSafe,
-} from "./normalizer.ts";
 import {
   BACKUP_PREFIX,
   STAGING_PREFIX,
@@ -34,7 +28,13 @@ import {
   isWithinCanonicalRoot,
   resolvePossiblyDanglingTarget,
   writeJsonAtomic,
-} from "./stores.ts";
+} from "./fs-safety.ts";
+import { inspectPluginDirectory } from "./inspector.ts";
+import { parseJsoncBomSafe } from "./jsonc.ts";
+import {
+  findPluginManifestFile,
+  normalizeAntigravityManifest,
+} from "./manifest.ts";
 
 interface AdaptInstallInput {
   readonly sourceDir: AbsolutePath;

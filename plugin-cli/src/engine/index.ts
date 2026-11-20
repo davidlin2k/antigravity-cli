@@ -70,33 +70,35 @@ import {
   resolveMarketplaceSource,
   syncSingleMarketplace,
 } from "./internal/fetcher.ts";
-import { inspectPluginDirectory } from "./internal/inspector.ts";
-import {
-  findPluginManifestFile,
-  normalizeAntigravityManifest,
-  parseJsoncBomSafe,
-} from "./internal/normalizer.ts";
-import { projectWorkspaceSnapshot } from "./internal/reconciler.ts";
 import {
   BACKUP_PREFIX,
   LockBusyError,
   STAGING_PREFIX,
+  errorMessage,
+  isWithinCanonicalRoot,
+  recoverAndCleanStagingArtifacts,
+  targetLockPath,
+  withTargetLock,
+} from "./internal/fs-safety.ts";
+import { inspectPluginDirectory } from "./internal/inspector.ts";
+import { parseJsoncBomSafe } from "./internal/jsonc.ts";
+import {
+  findPluginManifestFile,
+  normalizeAntigravityManifest,
+} from "./internal/manifest.ts";
+import { projectWorkspaceSnapshot } from "./internal/reconciler.ts";
+import {
   deleteReceipt,
   deleteSyncCache,
   deriveWorkspacePaths,
-  errorMessage,
-  isWithinCanonicalRoot,
   loadAllReceipts,
   loadAllSyncCaches,
   loadKnownMarketplaces,
   marketplaceMirrorPath,
-  recoverAndCleanStagingArtifacts,
   registryLockPath,
   saveKnownMarketplaces,
   saveReceipt,
   scopeRootFor,
-  targetLockPath,
-  withTargetLock,
   writeDerivedCaches,
 } from "./internal/stores.ts";
 import type { KnownMarketplaceEntry, ManagedProvenance, PersistedReceipt } from "./internal/stores.ts";

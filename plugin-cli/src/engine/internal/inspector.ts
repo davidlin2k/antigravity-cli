@@ -27,21 +27,20 @@ import type {
   SkillSummary,
 } from "../../domain/types.ts";
 import {
+  errorMessage,
+  isRecord,
+  isWithinCanonicalRoot,
+  resolvePossiblyDanglingTarget,
+} from "./fs-safety.ts";
+import { parseJsoncBomSafe, parseYamlFrontmatter } from "./jsonc.ts";
+import {
   extractAgentsFromJson,
   extractHooksSummary,
   extractMcpSummary,
   findFileCaseInsensitive,
   findPluginManifestFile,
   normalizeAntigravityManifest,
-  parseJsoncBomSafe,
-  parseYamlFrontmatter,
-} from "./normalizer.ts";
-import {
-  errorMessage,
-  isRecord,
-  isWithinCanonicalRoot,
-  resolvePossiblyDanglingTarget,
-} from "./stores.ts";
+} from "./manifest.ts";
 
 interface InspectPluginOptions {
   readonly pluginRoot: AbsolutePath;

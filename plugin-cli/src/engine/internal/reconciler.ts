@@ -37,13 +37,15 @@ import type {
   WorkspaceSnapshot,
   WorkspaceStats,
 } from "../../domain/types.ts";
-import { inspectPluginDirectory } from "./inspector.ts";
-import type { PluginInspectionResult } from "./inspector.ts";
 import {
   BACKUP_PREFIX,
   LOCK_PREFIX,
   STAGING_PREFIX,
   listStaleStagingPaths,
+} from "./fs-safety.ts";
+import { inspectPluginDirectory } from "./inspector.ts";
+import type { PluginInspectionResult } from "./inspector.ts";
+import {
   loadAllReceipts,
   loadAllSyncCaches,
   loadKnownMarketplaces,
