@@ -1,36 +1,25 @@
 import {
-  formatBytes,
   formatComponentsCompact,
-  formatMarketplaceSource,
   queryCatalog,
   queryDiagnostics,
   queryInstalled,
-  queryMarketplaces,
 } from "../domain/query.ts";
 import type { CatalogMatch } from "../domain/query.ts";
-import type {
-  Diagnostic,
-  InstalledPlugin,
-  MarketplaceRecord,
-} from "../domain/types.ts";
+import type { Diagnostic, InstalledPlugin } from "../domain/types.ts";
 import { EMPTY_TEXT_INPUT } from "./state.ts";
 import type {
   DiscoverFilterMode,
   ErrorSeverityFilter,
   InstalledScopeFilter,
-  StatsBreakdownMode,
   TabId,
-  TuiState,
 } from "./state.ts";
 import { defineTab } from "./tab-registry.ts";
-import type { CellTone, StyledCell, SummaryCard, TabDescriptor } from "./tab-registry.ts";
+import type { StyledCell, TabDescriptor } from "./tab-registry.ts";
+import { marketplacesTab } from "./tabs-marketplaces.ts";
+import { statsTab } from "./tabs-stats.ts";
 
 function formatNumber(value: number): string {
   return value.toLocaleString("en-US");
-}
-
-function formatShortTimestamp(iso: string): string {
-  return iso.slice(0, 10);
 }
 
 function formatDiagnosticSubject(subject: Diagnostic["subject"]): string {
@@ -93,21 +82,6 @@ function errorSeverityLabel(level: ErrorSeverityFilter): string {
   }
 }
 
-function statsModeLabel(mode: StatsBreakdownMode): string {
-  switch (mode) {
-    case "by-plugin":
-      return "By Plugin";
-    case "by-marketplace":
-      return "By Marketplace";
-    case "by-scope":
-      return "By Scope";
-    default: {
-      const _exhaustive: never = mode;
-      return _exhaustive;
-    }
-  }
-}
-
 function discoverInstallFilterArg(
   mode: DiscoverFilterMode,
 ): "all" | "installed" | "not-installed" {
@@ -153,127 +127,6 @@ function installedSourceLabel(plugin: InstalledPlugin): string {
       return "unmanaged";
     default: {
       const _exhaustive: never = plugin.provenance;
-      return _exhaustive;
-    }
-  }
-}
-
-function marketplaceSyncStatusCell(record: MarketplaceRecord): StyledCell {
-  switch (record.sync.kind) {
-    case "synced":
-      return { text: "synced", tone: "success" };
-    case "never-synced":
-      return { text: "pending", tone: "warning" };
-    case "sync-failed":
-      return { text: "failed", tone: "error" };
-    default: {
-      const _exhaustive: never = record.sync;
-      return _exhaustive;
-    }
-  }
-}
-
-interface StatsRow {
-  readonly key: string;
-  readonly entity: string;
-  readonly components: string;
-  readonly estTokens: string;
-  readonly disk: string;
-  readonly tone: CellTone;
-}
-
-function buildStatsRows(state: TuiState): readonly StatsRow[] {
-  const { snapshot, statsMode } = state;
-
-  switch (statsMode) {
-    case "by-plugin": {
-      const rows: StatsRow[] = [];
-      const sorted = [...snapshot.installed].sort((a, b) => {
-        const tokA = a.kind === "valid" ? a.estimatedDescriptionTokens : 0;
-        const tokB = b.kind === "valid" ? b.estimatedDescriptionTokens : 0;
-        if (tokB !== tokA) {
-          return tokB - tokA;
-        }
-        return b.diskBytes - a.diskBytes;
-      });
-      for (const plugin of sorted) {
-        const name = plugin.kind === "valid" ? plugin.manifest.name : plugin.dirName;
-        const tokens = plugin.kind === "valid" ? plugin.estimatedDescriptionTokens : 0;
-        const components =
-          plugin.kind === "valid" ? formatComponentsCompact(plugin.components.counts) : "broken";
-        const tone: CellTone =
-          plugin.kind === "broken"
-            ? "error"
-            : plugin.activation.kind === "shadowed"
-              ? "warning"
-              : plugin.activation.kind === "disabled"
-                ? "muted"
-                : tokens > 4000
-                  ? "warning"
-                  : "default";
-        rows.push({
-          key: `plugin:${plugin.id}`,
-          entity: `${name} (${plugin.scope})`,
-          components,
-          estTokens: formatNumber(tokens),
-          disk: formatBytes(plugin.diskBytes),
-          tone,
-        });
-      }
-      return rows;
-    }
-    case "by-marketplace": {
-      return snapshot.stats.byMarketplace.map((mkt) => {
-        let tokens = 0;
-        let diskBytes = 0;
-        for (const plugin of snapshot.installed) {
-          if (
-            plugin.provenance.kind === "marketplace" &&
-            plugin.provenance.marketplaceId === mkt.marketplaceId
-          ) {
-            diskBytes += plugin.diskBytes;
-            if (plugin.kind === "valid") {
-              tokens += plugin.estimatedDescriptionTokens;
-            }
-          }
-        }
-        const tone: CellTone =
-          mkt.syncStatus === "sync-failed"
-            ? "error"
-            : mkt.syncStatus === "never-synced"
-              ? "warning"
-              : "success";
-        return {
-          key: `mkt:${mkt.marketplaceId}`,
-          entity: mkt.marketplaceId,
-          components: `${formatNumber(mkt.catalogCount)} avail · ${formatNumber(mkt.installedFromCount)} inst`,
-          estTokens: tokens > 0 ? formatNumber(tokens) : "-",
-          disk: diskBytes > 0 ? formatBytes(diskBytes) : "-",
-          tone,
-        };
-      });
-    }
-    case "by-scope": {
-      const scopes = [snapshot.stats.byScope.user, snapshot.stats.byScope.project] as const;
-      return scopes.map((scopeStats) => {
-        let tokens = 0;
-        for (const plugin of snapshot.installed) {
-          if (plugin.scope === scopeStats.scope && plugin.kind === "valid") {
-            tokens += plugin.estimatedDescriptionTokens;
-          }
-        }
-        return {
-          key: `scope:${scopeStats.scope}`,
-          entity: `${scopeStats.scope} (${scopeStats.activeCount}/${scopeStats.installedCount} active)`,
-          components: formatComponentsCompact(scopeStats.componentTotals),
-          estTokens: formatNumber(tokens),
-          disk: formatBytes(scopeStats.diskBytes),
-          tone: scopeStats.brokenCount > 0 ? "warning" : "default",
-        };
-      });
-    }
-    default: {
-      const _exhaustive: never = statsMode;
       return _exhaustive;
     }
   }
@@ -600,163 +453,6 @@ const installedTab = defineTab<"installed", InstalledPlugin>({
   ],
 });
 
-const marketplacesTab = defineTab<"marketplaces", MarketplaceRecord>({
-  id: "marketplaces",
-  number: 3,
-  label: "Marketplaces",
-  searchable: true,
-  badge: (snapshot) => String(snapshot.marketplaces.length),
-  selectRows: (state) =>
-    queryMarketplaces(state.snapshot, state.searchByTab.marketplaces.value),
-  rowKey: (row) => row.id,
-  modeBadge: (state) => ({
-    text: `${formatNumber(state.snapshot.marketplaces.length)} configured`,
-    tone: "muted",
-  }),
-  emptyMessage: (state) =>
-    state.searchByTab.marketplaces.value.trim().length > 0
-      ? `No marketplaces matching "${state.searchByTab.marketplaces.value.trim()}".`
-      : "No marketplaces registered. Press 'a' to add GitHub, SSH, HTTPS, or local sources.",
-  columns: [
-    {
-      id: "name",
-      header: "Name",
-      width: { kind: "flex", min: 14, weight: 2 },
-      cell: (row) => ({ text: row.id, tone: "accent" }),
-    },
-    {
-      id: "kind",
-      header: "Kind",
-      width: { kind: "fixed", chars: 12 },
-      cell: (row) => ({ text: row.source.kind, tone: "muted" }),
-    },
-    {
-      id: "source",
-      header: "Source",
-      width: { kind: "flex", min: 18, weight: 4 },
-      cell: (row) => ({ text: formatMarketplaceSource(row.source), tone: "default" }),
-    },
-    {
-      id: "plugins",
-      header: "Plugins",
-      width: { kind: "fixed", chars: 8 },
-      align: "right",
-      cell: (row) => ({
-        text: row.sync.kind === "synced" ? formatNumber(row.sync.pluginCount) : "-",
-        tone: "default",
-      }),
-    },
-    {
-      id: "synced",
-      header: "Synced",
-      width: { kind: "fixed", chars: 11 },
-      cell: (row) => {
-        if (row.sync.kind === "synced") {
-          return { text: formatShortTimestamp(row.sync.syncedAt), tone: "muted" };
-        }
-        if (row.sync.kind === "sync-failed" && row.sync.lastGoodSyncAt !== null) {
-          return { text: formatShortTimestamp(row.sync.lastGoodSyncAt), tone: "muted" };
-        }
-        return { text: "never", tone: "muted" };
-      },
-    },
-    {
-      id: "status",
-      header: "Status",
-      width: { kind: "fixed", chars: 8 },
-      cell: (row) => marketplaceSyncStatusCell(row),
-    },
-  ],
-  actions: [
-    {
-      scope: "tab",
-      id: "add-marketplace",
-      key: { kind: "char", ch: "a" },
-      hintKeys: "a",
-      hintLabel: "add",
-      run: () => ({
-        kind: "open-overlay",
-        overlay: {
-          kind: "add-marketplace",
-          sourceInput: EMPTY_TEXT_INPUT,
-          idInput: EMPTY_TEXT_INPUT,
-          focusedField: "source",
-          preview: { kind: "empty" },
-        },
-      }),
-    },
-    {
-      scope: "row",
-      id: "open-marketplace-detail",
-      key: "enter",
-      hintKeys: "Enter",
-      hintLabel: "details",
-      run: (row) => ({
-        kind: "open-overlay",
-        overlay: {
-          kind: "marketplace-detail",
-          marketplaceId: row.id,
-          focusedAction: "update",
-        },
-      }),
-    },
-    {
-      scope: "row",
-      id: "update-marketplace",
-      key: { kind: "char", ch: "u" },
-      hintKeys: "u",
-      hintLabel: "update",
-      run: (row) => ({
-        kind: "mutate",
-        mutation: {
-          kind: "sync-marketplaces",
-          input: { kind: "single", id: row.id },
-          label: `Syncing marketplace ${row.id}`,
-        },
-      }),
-    },
-    {
-      scope: "tab",
-      id: "update-all-marketplaces",
-      key: { kind: "char", ch: "U" },
-      hintKeys: "U",
-      hintLabel: "update all",
-      when: (state) => state.snapshot.marketplaces.length > 0,
-      run: () => ({
-        kind: "mutate",
-        mutation: {
-          kind: "sync-marketplaces",
-          input: { kind: "all" },
-          label: "Syncing all marketplaces",
-        },
-      }),
-    },
-    {
-      scope: "row",
-      id: "remove-marketplace",
-      key: { kind: "char", ch: "d" },
-      hintKeys: "d",
-      hintLabel: "remove",
-      run: (row) => ({
-        kind: "open-overlay",
-        overlay: {
-          kind: "confirm",
-          title: "Remove marketplace",
-          message: `Remove marketplace "${row.id}" and its local mirror? Installed plugins remain untouched.`,
-          confirmLabel: "Remove",
-          mutation: {
-            kind: "remove-marketplace",
-            input: { id: row.id },
-            label: `Removing marketplace ${row.id}`,
-          },
-          returnOverlay: { kind: "none" },
-          focusedChoice: "cancel",
-        },
-      }),
-    },
-  ],
-});
-
 const errorsTab = defineTab<"errors", Diagnostic>({
   id: "errors",
   number: 4,
@@ -864,107 +560,6 @@ const errorsTab = defineTab<"errors", Diagnostic>({
       key: { kind: "char", ch: "r" },
       hintKeys: "r",
       hintLabel: "re-check",
-      run: () => ({ kind: "rescan" }),
-    },
-  ],
-});
-
-const statsTab = defineTab<"stats", StatsRow>({
-  id: "stats",
-  number: 5,
-  label: "Stats",
-  searchable: false,
-  badge: () => null,
-  selectRows: (state) => buildStatsRows(state),
-  rowKey: (row) => row.key,
-  modeBadge: (state) => ({
-    text: `View [m]: ${statsModeLabel(state.statsMode)}`,
-    tone: "accent",
-  }),
-  summaryCards: (state): readonly SummaryCard[] => {
-    const { stats, marketplaces } = state.snapshot;
-    const c = stats.activeComponents;
-    const totalComponents = c.skills + c.agents + c.rules + c.hooks + c.mcpServers;
-    return [
-      {
-        label: "Discoverable",
-        value: formatNumber(stats.discoverableCount),
-        subtext: `${formatNumber(marketplaces.length)} mkts`,
-        tone: "accent",
-      },
-      {
-        label: "Installed",
-        value: `${formatNumber(stats.activeCount)}/${formatNumber(stats.installedCount)}`,
-        subtext: "active/total",
-        tone: stats.brokenCount > 0 || stats.shadowedCount > 0 ? "warning" : "success",
-      },
-      {
-        label: "Components",
-        value: formatNumber(totalComponents),
-        subtext: `${c.skills}S ${c.agents}A ${c.rules}R ${c.hooks}H ${c.mcpServers}M`,
-        tone: "default",
-      },
-      {
-        label: "Desc Tokens",
-        value: `~${formatNumber(stats.estimatedDescriptionTokens)}`,
-        subtext: "session load",
-        tone: stats.estimatedDescriptionTokens > 15000 ? "warning" : "accent",
-      },
-      {
-        label: "Disk",
-        value: formatBytes(stats.totalDiskBytes),
-        subtext: `${stats.errorCount} err ${stats.warningCount} warn`,
-        tone: stats.errorCount > 0 ? "error" : "default",
-      },
-    ];
-  },
-  emptyMessage: (state) =>
-    state.statsMode === "by-marketplace"
-      ? "No marketplaces configured yet."
-      : "No installed plugins yet.",
-  columns: [
-    {
-      id: "entity",
-      header: "Entity",
-      width: { kind: "flex", min: 20, weight: 3 },
-      cell: (row) => ({ text: row.entity, tone: row.tone }),
-    },
-    {
-      id: "components",
-      header: "Components / Items",
-      width: { kind: "flex", min: 18, weight: 3 },
-      cell: (row) => ({ text: row.components, tone: "default" }),
-    },
-    {
-      id: "tokens",
-      header: "Est. Tokens",
-      width: { kind: "fixed", chars: 12 },
-      align: "right",
-      cell: (row) => ({ text: row.estTokens, tone: "warning" }),
-    },
-    {
-      id: "disk",
-      header: "Disk",
-      width: { kind: "fixed", chars: 10 },
-      align: "right",
-      cell: (row) => ({ text: row.disk, tone: "muted" }),
-    },
-  ],
-  actions: [
-    {
-      scope: "tab",
-      id: "cycle-stats-mode",
-      key: { kind: "char", ch: "m" },
-      hintKeys: "m",
-      hintLabel: "breakdown",
-      run: () => ({ kind: "cycle-stats-mode" }),
-    },
-    {
-      scope: "tab",
-      id: "refresh-stats",
-      key: { kind: "char", ch: "r" },
-      hintKeys: "r",
-      hintLabel: "refresh",
       run: () => ({ kind: "rescan" }),
     },
   ],

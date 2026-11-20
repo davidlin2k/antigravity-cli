@@ -17,7 +17,6 @@ import {
   nextSnapshotRevision,
 } from "../src/domain/types.ts";
 import type {
-  AbsolutePath,
   CatalogEntry,
   CatalogEntryId,
   Diagnostic,
