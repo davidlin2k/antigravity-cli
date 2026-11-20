@@ -37,7 +37,12 @@ import {
   parseJsoncBomSafe,
   parseYamlFrontmatter,
 } from "./normalizer.ts";
-import { errorMessage, isRecord } from "./stores.ts";
+import {
+  errorMessage,
+  isRecord,
+  isWithinCanonicalRoot,
+  resolvePossiblyDanglingTarget,
+} from "./stores.ts";
 
 export interface InspectPluginOptions {
   readonly pluginRoot: AbsolutePath;
@@ -75,20 +80,34 @@ function subjectKey(subject: DiagnosticSubject): string {
   }
 }
 
-function isWithinCanonicalRoot(resolvedPath: string, canonicalRoot: string): boolean {
-  return resolvedPath === canonicalRoot || resolvedPath.startsWith(`${canonicalRoot}${path.sep}`);
+function collectUnexpandedPluginRootVars(value: unknown, found: Set<string>): void {
+  if (typeof value === "string") {
+    PLUGIN_ROOT_VAR_RE.lastIndex = 0;
+    let match = PLUGIN_ROOT_VAR_RE.exec(value);
+    while (match !== null) {
+      if (match[0] !== undefined) {
+        found.add(match[0]);
+      }
+      match = PLUGIN_ROOT_VAR_RE.exec(value);
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectUnexpandedPluginRootVars(item, found);
+    }
+    return;
+  }
+  if (isRecord(value)) {
+    for (const child of Object.values(value)) {
+      collectUnexpandedPluginRootVars(child, found);
+    }
+  }
 }
 
-export function findUnexpandedPluginRootVars(text: string): NonEmpty<string> | null {
+export function findUnexpandedPluginRootVarsInValue(value: unknown): NonEmpty<string> | null {
   const found = new Set<string>();
-  PLUGIN_ROOT_VAR_RE.lastIndex = 0;
-  let match = PLUGIN_ROOT_VAR_RE.exec(text);
-  while (match !== null) {
-    if (match[0] !== undefined) {
-      found.add(match[0]);
-    }
-    match = PLUGIN_ROOT_VAR_RE.exec(text);
-  }
+  collectUnexpandedPluginRootVars(value, found);
   const list = [...found];
   return isNonEmpty(list) ? list : null;
 }
@@ -128,13 +147,14 @@ function removeRemediation(
 interface WalkStats {
   diskBytes: number;
   readonly unsafePaths: Set<string>;
+  readonly countedRealFiles: Set<string>;
 }
 
 async function walkAndCheckContainment(input: {
   readonly currentDir: AbsolutePath;
   readonly canonicalRoot: string;
   readonly relPrefix: string;
-  readonly visitedRealDirs: Set<string>;
+  readonly ancestorRealDirs: ReadonlySet<string>;
   readonly stats: WalkStats;
   readonly subject: DiagnosticSubject;
   readonly pluginIdForRemediation: InstalledPluginId | undefined;
@@ -168,7 +188,7 @@ async function walkAndCheckContainment(input: {
       } catch {
         try {
           const linkRaw = await fs.readlink(entryAbs);
-          resolvedTarget = path.resolve(path.dirname(entryAbs), linkRaw);
+          resolvedTarget = await resolvePossiblyDanglingTarget(input.currentDir, linkRaw);
         } catch {
           resolvedTarget = entryAbs;
         }
@@ -194,16 +214,21 @@ async function walkAndCheckContainment(input: {
 
       if (targetStat !== null) {
         if (targetStat.isDirectory()) {
-          if (!input.visitedRealDirs.has(resolvedTarget)) {
-            input.visitedRealDirs.add(resolvedTarget);
+          if (!input.ancestorRealDirs.has(resolvedTarget)) {
+            const nextAncestors = new Set(input.ancestorRealDirs);
+            nextAncestors.add(resolvedTarget);
             await walkAndCheckContainment({
               ...input,
-              currentDir: entryAbs,
+              currentDir: makeAbsolutePath(resolvedTarget),
               relPrefix: relPath,
+              ancestorRealDirs: nextAncestors,
             });
           }
         } else if (targetStat.isFile()) {
-          input.stats.diskBytes += targetStat.size;
+          if (!input.stats.countedRealFiles.has(resolvedTarget)) {
+            input.stats.countedRealFiles.add(resolvedTarget);
+            input.stats.diskBytes += targetStat.size;
+          }
         }
       }
       continue;
@@ -233,16 +258,21 @@ async function walkAndCheckContainment(input: {
         });
         continue;
       }
-      if (!input.visitedRealDirs.has(realDir)) {
-        input.visitedRealDirs.add(realDir);
+      if (!input.ancestorRealDirs.has(realDir)) {
+        const nextAncestors = new Set(input.ancestorRealDirs);
+        nextAncestors.add(realDir);
         await walkAndCheckContainment({
           ...input,
-          currentDir: entryAbs,
+          currentDir: makeAbsolutePath(realDir),
           relPrefix: relPath,
+          ancestorRealDirs: nextAncestors,
         });
       }
     } else if (lstat.isFile()) {
-      input.stats.diskBytes += lstat.size;
+      if (!input.stats.countedRealFiles.has(entryAbs)) {
+        input.stats.countedRealFiles.add(entryAbs);
+        input.stats.diskBytes += lstat.size;
+      }
     }
   }
 }
@@ -277,6 +307,7 @@ async function scanRulesDir(
   dir: AbsolutePath,
   canonicalRoot: string,
   relPrefix: string,
+  ancestorRealDirs: ReadonlySet<string>,
   out: RuleSummary[],
 ): Promise<void> {
   let entries;
@@ -290,7 +321,12 @@ async function scanRulesDir(
     const abs = makeAbsolutePath(path.join(dir, entry.name));
     const rel = `${relPrefix}/${entry.name}`;
     if (await isSafeExistingDir(abs, canonicalRoot)) {
-      await scanRulesDir(abs, canonicalRoot, rel, out);
+      const realSub = await fs.realpath(abs).catch(() => null);
+      if (realSub !== null && !ancestorRealDirs.has(realSub)) {
+        const nextAncestors = new Set(ancestorRealDirs);
+        nextAncestors.add(realSub);
+        await scanRulesDir(makeAbsolutePath(realSub), canonicalRoot, rel, nextAncestors, out);
+      }
     } else if (
       entry.name.toLowerCase().endsWith(".md") &&
       (await isSafeExistingFile(abs, canonicalRoot))
@@ -372,13 +408,16 @@ export async function inspectPluginDirectory(
     };
   }
 
-  const walkStats: WalkStats = { diskBytes: 0, unsafePaths: new Set() };
-  const visitedRealDirs = new Set<string>([canonicalRoot]);
+  const walkStats: WalkStats = {
+    diskBytes: 0,
+    unsafePaths: new Set(),
+    countedRealFiles: new Set(),
+  };
   await walkAndCheckContainment({
-    currentDir: pluginRoot,
+    currentDir: makeAbsolutePath(canonicalRoot),
     canonicalRoot,
     relPrefix: "",
-    visitedRealDirs,
+    ancestorRealDirs: new Set<string>([canonicalRoot]),
     stats: walkStats,
     subject,
     pluginIdForRemediation,
@@ -587,7 +626,16 @@ export async function inspectPluginDirectory(
   const rules: RuleSummary[] = [];
   const rulesDir = makeAbsolutePath(path.join(pluginRoot, "rules"));
   if (await isSafeExistingDir(rulesDir, canonicalRoot)) {
-    await scanRulesDir(rulesDir, canonicalRoot, "rules", rules);
+    const realRulesDir = await fs.realpath(rulesDir).catch(() => null);
+    if (realRulesDir !== null) {
+      await scanRulesDir(
+        makeAbsolutePath(realRulesDir),
+        canonicalRoot,
+        "rules",
+        new Set<string>([canonicalRoot, realRulesDir]),
+        rules,
+      );
+    }
   }
   for (const rootRule of ["AGENTS.md", "GEMINI.md"] as const) {
     const rootRulePath = makeAbsolutePath(path.join(pluginRoot, rootRule));
@@ -609,7 +657,6 @@ export async function inspectPluginDirectory(
   if (hasRootHooks) {
     try {
       const rawBytes = await fs.readFile(rootHooksPath);
-      const rawText = Buffer.from(rawBytes).toString("utf8");
       const parsed = parseJsoncBomSafe(rawBytes, rootHooksPath);
       if (!parsed.ok) {
         diagnostics.push({
@@ -672,7 +719,7 @@ export async function inspectPluginDirectory(
             hint: "Fix the invalid regular expression in hooks.json matcher.",
           });
         }
-        const unexpanded = findUnexpandedPluginRootVars(rawText);
+        const unexpanded = findUnexpandedPluginRootVarsInValue(parsed.value);
         if (unexpanded !== null) {
           diagnostics.push({
             id: makeDiagnosticId("unexpanded-plugin-root", subKey, "hooks-json"),
@@ -708,8 +755,11 @@ export async function inspectPluginDirectory(
       ...readaptRemediation(pluginIdForRemediation, "Re-adapt hooks/hooks.json"),
     });
     try {
-      const nestedText = await fs.readFile(nestedHooksPath, "utf8");
-      const unexpanded = findUnexpandedPluginRootVars(nestedText);
+      const nestedBytes = await fs.readFile(nestedHooksPath);
+      const parsedNested = parseJsoncBomSafe(nestedBytes, nestedHooksPath);
+      const unexpanded = parsedNested.ok
+        ? findUnexpandedPluginRootVarsInValue(parsedNested.value)
+        : null;
       if (unexpanded !== null) {
         diagnostics.push({
           id: makeDiagnosticId("unexpanded-plugin-root", subKey, "nested-hooks"),
@@ -738,7 +788,6 @@ export async function inspectPluginDirectory(
   if (hasRootMcp) {
     try {
       const rawBytes = await fs.readFile(rootMcpPath);
-      const rawText = Buffer.from(rawBytes).toString("utf8");
       const parsed = parseJsoncBomSafe(rawBytes, rootMcpPath);
       if (!parsed.ok) {
         diagnostics.push({
@@ -783,7 +832,7 @@ export async function inspectPluginDirectory(
           hint: "Ensure mcpServers maps server names to configuration objects.",
         });
       } else {
-        const unexpanded = findUnexpandedPluginRootVars(rawText);
+        const unexpanded = findUnexpandedPluginRootVarsInValue(parsed.value);
         if (unexpanded !== null) {
           diagnostics.push({
             id: makeDiagnosticId("unexpanded-plugin-root", subKey, "mcp-config"),
@@ -818,8 +867,11 @@ export async function inspectPluginDirectory(
       ...readaptRemediation(pluginIdForRemediation, "Re-adapt .mcp.json"),
     });
     try {
-      const nestedText = await fs.readFile(nestedMcpPath, "utf8");
-      const unexpanded = findUnexpandedPluginRootVars(nestedText);
+      const nestedBytes = await fs.readFile(nestedMcpPath);
+      const parsedNested = parseJsoncBomSafe(nestedBytes, nestedMcpPath);
+      const unexpanded = parsedNested.ok
+        ? findUnexpandedPluginRootVarsInValue(parsedNested.value)
+        : null;
       if (unexpanded !== null) {
         diagnostics.push({
           id: makeDiagnosticId("unexpanded-plugin-root", subKey, "dot-mcp"),

@@ -1117,6 +1117,599 @@ describe("PluginEngine read-only snapshot purity, crash recovery, JSONC errors, 
   });
 });
 
+describe("PluginEngine adversarial regression coverage (Round A)", () => {
+  it("catches dangling symlink escapes behind deeper dir symlinks while copying valid sibling dir symlinks cleanly", async () => {
+    const ws = await makeTempWorkspace();
+    const engine = createPluginEngine({
+      homeDir: ws.homeDir,
+      configDir: ws.configDir,
+      workspaceDir: ws.workspaceDir,
+    });
+
+    const escapeBundle = makeAbsolutePath(path.join(ws.root, "nested-escape-bundle"));
+    await writeText(
+      path.join(escapeBundle, "plugin.json"),
+      JSON.stringify({ name: "nested-escape", version: "1.0.0" }),
+    );
+    await fs.mkdir(path.join(escapeBundle, "real"), { recursive: true });
+    await fs.symlink("../../outside-nonexistent", path.join(escapeBundle, "real", "dangling"));
+    await fs.mkdir(path.join(escapeBundle, "deep", "nested"), { recursive: true });
+    await fs.symlink("../../real", path.join(escapeBundle, "deep", "nested", "alias"));
+
+    const validation = await engine.validate({
+      kind: "source",
+      source: { kind: "local-folder", path: escapeBundle },
+    });
+    assert.equal(validation.valid, false);
+    assert.ok(
+      validation.diagnostics.some((d) => d.detail.kind === "path-traversal-rejected"),
+      "inspector must catch dangling escape inside dir reached via deeper symlink",
+    );
+
+    const installEsc = await engine.install({
+      target: { kind: "direct-source", source: { kind: "local-folder", path: escapeBundle } },
+      scope: "user",
+    });
+    assert.equal(installEsc.ok, false);
+    if (!installEsc.ok) {
+      assert.equal(installEsc.error.kind, "path-traversal");
+    }
+
+    const validSymlinkBundle = makeAbsolutePath(path.join(ws.root, "valid-symlink-bundle"));
+    await writeText(
+      path.join(validSymlinkBundle, "plugin.json"),
+      JSON.stringify({ name: "symlink-skills", version: "1.0.0" }),
+    );
+    await writeText(
+      path.join(validSymlinkBundle, "a-src", "skills", "demo", "SKILL.md"),
+      "---\nname: demo\ndescription: Linked skill\n---\n# Demo\n",
+    );
+    await fs.symlink("a-src/skills", path.join(validSymlinkBundle, "skills"));
+    await fs.mkdir(path.join(validSymlinkBundle, "sub"), { recursive: true });
+    await fs.symlink("..", path.join(validSymlinkBundle, "sub", "loop"));
+
+    const installOk = await engine.install({
+      target: {
+        kind: "direct-source",
+        source: { kind: "local-folder", path: validSymlinkBundle },
+      },
+      scope: "user",
+    });
+    assert.equal(installOk.ok, true);
+    if (installOk.ok) {
+      const copiedSkill = await fs.readFile(
+        path.join(installOk.report.installPath, "skills", "demo", "SKILL.md"),
+        "utf8",
+      );
+      assert.match(copiedSkill, /Linked skill/);
+      const installed = installOk.snapshot.installedById.get(installOk.report.pluginId);
+      assert.ok(installed !== undefined && installed.kind === "valid");
+      assert.equal(installed.components.counts.skills, 1);
+    }
+  });
+
+  it("rejects symlinked marketplace.json and plugin.json escaping the marketplace root without reading external files", async () => {
+    const ws = await makeTempWorkspace();
+    const engine = createPluginEngine({
+      homeDir: ws.homeDir,
+      configDir: ws.configDir,
+      workspaceDir: ws.workspaceDir,
+    });
+
+    const externalCatalog = path.join(ws.root, "external-marketplace.json");
+    await writeText(
+      externalCatalog,
+      JSON.stringify({ plugins: [{ name: "leaked", source: "leaked" }] }),
+    );
+    const externalPluginManifest = path.join(ws.root, "external-plugin.json");
+    await writeText(
+      externalPluginManifest,
+      JSON.stringify({ name: "leaked-plugin", version: "9.9.9", description: "SECRET_BODY" }),
+    );
+
+    const symlinkMktDir = makeAbsolutePath(path.join(ws.root, "symlink-mkt"));
+    await fs.mkdir(symlinkMktDir, { recursive: true });
+    await fs.symlink(externalCatalog, path.join(symlinkMktDir, "marketplace.json"));
+
+    const addSymMkt = await engine.addMarketplace({
+      source: { kind: "local-folder", path: symlinkMktDir },
+      id: makeMarketplaceId("sym-mkt"),
+    });
+    assert.equal(addSymMkt.ok, false);
+    assert.equal(addSymMkt.snapshot.catalog.length, 0);
+    assert.ok(
+      addSymMkt.snapshot.diagnostics.some((d) => d.detail.kind === "path-traversal-rejected"),
+    );
+
+    const symlinkSingleDir = makeAbsolutePath(path.join(ws.root, "symlink-single"));
+    await fs.mkdir(symlinkSingleDir, { recursive: true });
+    await fs.symlink(externalPluginManifest, path.join(symlinkSingleDir, "plugin.json"));
+
+    const addSymSingle = await engine.addMarketplace({
+      source: { kind: "local-folder", path: symlinkSingleDir },
+      id: makeMarketplaceId("sym-single"),
+    });
+    assert.equal(addSymSingle.ok, false);
+    assert.equal(addSymSingle.snapshot.catalog.length, 0);
+    assert.ok(
+      addSymSingle.snapshot.diagnostics.some(
+        (d) =>
+          d.subject.kind === "marketplace" &&
+          d.subject.marketplaceId === "sym-single" &&
+          d.detail.kind === "path-traversal-rejected",
+      ),
+    );
+
+    const subdirEscapeMkt = makeAbsolutePath(path.join(ws.root, "subdir-escape-mkt"));
+    await writeText(
+      path.join(subdirEscapeMkt, "marketplace.json"),
+      JSON.stringify({ plugins: [{ name: "sneaky", source: "sneaky" }] }),
+    );
+    await fs.mkdir(path.join(subdirEscapeMkt, "sneaky"), { recursive: true });
+    await fs.symlink(externalPluginManifest, path.join(subdirEscapeMkt, "sneaky", "plugin.json"));
+
+    const addSubEscape = await engine.addMarketplace({
+      source: { kind: "local-folder", path: subdirEscapeMkt },
+      id: makeMarketplaceId("sub-escape"),
+    });
+    assert.equal(addSubEscape.ok, true);
+    assert.equal(
+      addSubEscape.snapshot.catalog.some((e) => e.marketplaceId === "sub-escape"),
+      false,
+    );
+    assert.ok(
+      addSubEscape.snapshot.diagnostics.some(
+        (d) =>
+          d.subject.kind === "marketplace" &&
+          d.subject.marketplaceId === "sub-escape" &&
+          d.detail.kind === "path-traversal-rejected",
+      ),
+    );
+  });
+
+  it("preserves custom plugin.json fields during setEnabled and rejects escaping symlinked plugin.json", async () => {
+    const ws = await makeTempWorkspace();
+    const engine = createPluginEngine({
+      homeDir: ws.homeDir,
+      configDir: ws.configDir,
+      workspaceDir: ws.workspaceDir,
+    });
+
+    const pluginDir = path.join(ws.configDir, "plugins", "rich-manifest");
+    await writeText(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify(
+        {
+          name: "rich-manifest",
+          version: "1.0.0",
+          license: "Apache-2.0",
+          keywords: ["custom", "keep"],
+          author: { name: "Ada Lovelace", email: "ada@example.com" },
+          customNested: { flag: true },
+        },
+        null,
+        2,
+      ),
+    );
+
+    const richId = makeInstalledPluginId("user", makePluginDirName("rich-manifest"));
+    const disabled = await engine.setEnabled({
+      selector: { kind: "id", id: richId },
+      enabled: false,
+    });
+    assert.equal(disabled.ok, true);
+    const disabledObj = parseJsonObject(await fs.readFile(path.join(pluginDir, "plugin.json"), "utf8"));
+    assert.equal(disabledObj.disabled, true);
+    assert.equal(disabledObj.license, "Apache-2.0");
+    assert.deepEqual(disabledObj.keywords, ["custom", "keep"]);
+    assert.deepEqual(disabledObj.author, { name: "Ada Lovelace", email: "ada@example.com" });
+    assert.deepEqual(disabledObj.customNested, { flag: true });
+
+    const reenabled = await engine.setEnabled({
+      selector: { kind: "id", id: richId },
+      enabled: true,
+    });
+    assert.equal(reenabled.ok, true);
+    const enabledObj = parseJsonObject(await fs.readFile(path.join(pluginDir, "plugin.json"), "utf8"));
+    assert.equal("disabled" in enabledObj, false);
+    assert.equal(enabledObj.license, "Apache-2.0");
+    assert.deepEqual(enabledObj.author, { name: "Ada Lovelace", email: "ada@example.com" });
+
+    const externalTarget = path.join(ws.root, "external-target.json");
+    const externalOriginal = JSON.stringify({ name: "escaped", version: "1.0.0" });
+    await writeText(externalTarget, externalOriginal);
+    const symPluginDir = path.join(ws.configDir, "plugins", "sym-toggle");
+    await fs.mkdir(symPluginDir, { recursive: true });
+    await fs.symlink(externalTarget, path.join(symPluginDir, "plugin.json"));
+
+    const toggleEscape = await engine.setEnabled({
+      selector: { kind: "id", id: makeInstalledPluginId("user", makePluginDirName("sym-toggle")) },
+      enabled: false,
+    });
+    assert.equal(toggleEscape.ok, false);
+    if (!toggleEscape.ok) {
+      assert.equal(toggleEscape.error.kind, "path-traversal");
+    }
+    assert.equal(await fs.readFile(externalTarget, "utf8"), externalOriginal);
+  });
+
+  it("isolates per-plugin staging cleanup during concurrent installs and skips live-locked staging during remediation", async () => {
+    const ws = await makeTempWorkspace();
+    const engine = createPluginEngine({
+      homeDir: ws.homeDir,
+      configDir: ws.configDir,
+      workspaceDir: ws.workspaceDir,
+    });
+
+    const userPluginsDir = path.join(ws.configDir, "plugins");
+    const activeOtherStage = makeAbsolutePath(
+      path.join(userPluginsDir, ".agy-stage-other-plugin-abcdef123456"),
+    );
+    await writeText(path.join(activeOtherStage, "marker.txt"), "in-flight");
+
+    const srcA = makeAbsolutePath(path.join(ws.root, "conc-a"));
+    const srcB = makeAbsolutePath(path.join(ws.root, "conc-b"));
+    const srcC = makeAbsolutePath(path.join(ws.root, "conc-c"));
+    await writeText(path.join(srcA, "plugin.json"), JSON.stringify({ name: "conc-a", version: "1.0.0" }));
+    await writeText(path.join(srcB, "plugin.json"), JSON.stringify({ name: "conc-b", version: "1.0.0" }));
+    await writeText(path.join(srcC, "plugin.json"), JSON.stringify({ name: "conc-c", version: "1.0.0" }));
+
+    const results = await Promise.all([
+      engine.install({
+        target: { kind: "direct-source", source: { kind: "local-folder", path: srcA } },
+        scope: "user",
+      }),
+      engine.install({
+        target: { kind: "direct-source", source: { kind: "local-folder", path: srcB } },
+        scope: "user",
+      }),
+      engine.install({
+        target: { kind: "direct-source", source: { kind: "local-folder", path: srcC } },
+        scope: "user",
+      }),
+    ]);
+    assert.ok(results.every((r) => r.ok));
+    assert.equal(
+      await fs
+        .stat(activeOtherStage)
+        .then(() => true)
+        .catch(() => false),
+      true,
+      "installing other plugins must not delete an unrelated staging directory",
+    );
+
+    const abandonedStage = makeAbsolutePath(
+      path.join(userPluginsDir, ".agy-stage-abandoned-abcdef123456"),
+    );
+    await writeText(path.join(abandonedStage, "stale.txt"), "old");
+    await writeText(
+      path.join(userPluginsDir, ".agy-lock-other-plugin"),
+      JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
+    );
+
+    const cleaned = await engine.remediate({
+      plan: { kind: "clean-stale-staging", label: "Clean stale staging" },
+    });
+    assert.equal(cleaned.ok, true);
+    assert.equal(
+      await fs
+        .stat(abandonedStage)
+        .then(() => true)
+        .catch(() => false),
+      false,
+    );
+    assert.equal(
+      await fs
+        .stat(activeOtherStage)
+        .then(() => true)
+        .catch(() => false),
+      true,
+      "remediation must skip staging directories whose lock is held by a live PID",
+    );
+  });
+
+  it("preserves disabled state across engine.update() so resolved collisions stay disabled", async () => {
+    const ws = await makeTempWorkspace();
+    const bareRepo = makeAbsolutePath(path.join(ws.root, "disabled-upd.git"));
+    const workRepo = path.join(ws.root, "disabled-upd-work");
+    await fs.mkdir(bareRepo, { recursive: true });
+    await runGitTest(["init", "--bare", "--initial-branch=main"], bareRepo);
+    await runGitTest(["clone", bareRepo, workRepo], ws.root);
+
+    await writeText(
+      path.join(workRepo, "marketplace.json"),
+      JSON.stringify({ plugins: [{ name: "shared-upd", source: "shared-upd" }] }),
+    );
+    await writeText(
+      path.join(workRepo, "shared-upd", "plugin.json"),
+      JSON.stringify({ name: "shared-upd", version: "1.0.0" }),
+    );
+    await runGitTest(["add", "."], workRepo);
+    await runGitTest(["commit", "-m", "v1.0.0"], workRepo);
+    await runGitTest(["push", "origin", "main"], workRepo);
+
+    const engine = createPluginEngine({
+      homeDir: ws.homeDir,
+      configDir: ws.configDir,
+      workspaceDir: ws.workspaceDir,
+    });
+    const mktId = makeMarketplaceId("disabled-upd");
+    await engine.addMarketplace({ source: { kind: "local-folder", path: bareRepo }, id: mktId });
+
+    const entryTarget = {
+      kind: "catalog-entry" as const,
+      entryId: makeCatalogEntryId(mktId, makePluginDirName("shared-upd")),
+    };
+    const instUser = await engine.install({ target: entryTarget, scope: "user" });
+    assert.equal(instUser.ok, true);
+    const instProj = await engine.install({
+      target: entryTarget,
+      scope: "project",
+      allowNameCollision: true,
+    });
+    assert.equal(instProj.ok, true);
+
+    const userId = makeInstalledPluginId("user", makePluginDirName("shared-upd"));
+    const disabled = await engine.setEnabled({
+      selector: { kind: "id", id: userId },
+      enabled: false,
+    });
+    assert.equal(disabled.ok, true);
+
+    await writeText(
+      path.join(workRepo, "shared-upd", "plugin.json"),
+      JSON.stringify({ name: "shared-upd", version: "1.1.0" }),
+    );
+    await runGitTest(["add", "."], workRepo);
+    await runGitTest(["commit", "-m", "v1.1.0"], workRepo);
+    await runGitTest(["push", "origin", "main"], workRepo);
+
+    const updated = await engine.update({ kind: "all" });
+    assert.equal(updated.ok, true);
+    if (updated.ok) {
+      const userOutcome = updated.report.outcomes.find((o) => o.pluginId === userId);
+      assert.equal(userOutcome?.status, "updated");
+      assert.equal(userOutcome?.toVersion, "1.1.0");
+      const userRec = updated.snapshot.installedById.get(userId);
+      assert.ok(userRec !== undefined && userRec.kind === "valid");
+      assert.equal(userRec.manifest.disabled, true);
+      assert.deepEqual(userRec.activation, { kind: "disabled" });
+      assert.equal(
+        updated.snapshot.diagnostics.some((d) => d.detail.kind === "name-collision"),
+        false,
+      );
+    }
+  });
+
+  it("propagates catalog-only version on install so updateAvailable starts null and tracks subsequent catalog bumps", async () => {
+    const ws = await makeTempWorkspace();
+    const mktDir = makeAbsolutePath(path.join(ws.root, "catalog-ver-mkt"));
+    await writeText(
+      path.join(mktDir, "marketplace.json"),
+      JSON.stringify({
+        plugins: [{ name: "catalog-ver", source: "catalog-ver", version: "1.2.3" }],
+      }),
+    );
+    await writeText(
+      path.join(mktDir, "catalog-ver", "plugin.json"),
+      JSON.stringify({ name: "catalog-ver", description: "Version lives only in marketplace.json" }),
+    );
+
+    const engine = createPluginEngine({
+      homeDir: ws.homeDir,
+      configDir: ws.configDir,
+      workspaceDir: ws.workspaceDir,
+    });
+    const mktId = makeMarketplaceId("catalog-ver-mkt");
+    const added = await engine.addMarketplace({
+      source: { kind: "local-folder", path: mktDir },
+      id: mktId,
+    });
+    assert.equal(added.ok, true);
+
+    const inst = await engine.install({
+      target: {
+        kind: "catalog-entry",
+        entryId: makeCatalogEntryId(mktId, makePluginDirName("catalog-ver")),
+      },
+      scope: "user",
+    });
+    assert.equal(inst.ok, true);
+    if (inst.ok) {
+      const rec = inst.snapshot.installedById.get(inst.report.pluginId);
+      assert.ok(rec !== undefined && rec.kind === "valid");
+      assert.equal(rec.manifest.version, "1.2.3");
+      assert.equal(rec.updateAvailable, null);
+    }
+
+    await writeText(
+      path.join(mktDir, "marketplace.json"),
+      JSON.stringify({
+        plugins: [{ name: "catalog-ver", source: "catalog-ver", version: "1.3.0" }],
+      }),
+    );
+    const synced = await engine.syncMarketplaces({ kind: "single", id: mktId });
+    assert.equal(synced.ok, true);
+    if (synced.ok) {
+      const rec = synced.snapshot.installedById.get(
+        makeInstalledPluginId("user", makePluginDirName("catalog-ver")),
+      );
+      assert.ok(rec !== undefined && rec.kind === "valid");
+      assert.equal(rec.updateAvailable?.latestVersion, "1.3.0");
+    }
+
+    const updated = await engine.update({
+      kind: "single",
+      selector: {
+        kind: "id",
+        id: makeInstalledPluginId("user", makePluginDirName("catalog-ver")),
+      },
+    });
+    assert.equal(updated.ok, true);
+    if (updated.ok) {
+      assert.equal(updated.report.outcomes[0]?.status, "updated");
+      assert.equal(updated.report.outcomes[0]?.toVersion, "1.3.0");
+      const rec = updated.snapshot.installedById.get(
+        makeInstalledPluginId("user", makePluginDirName("catalog-ver")),
+      );
+      assert.ok(rec !== undefined && rec.kind === "valid");
+      assert.equal(rec.updateAvailable, null);
+    }
+  });
+
+  it("supports marketplace.json source '.' and './' via marketplace-root while rejecting absolute local source paths", async () => {
+    const ws = await makeTempWorkspace();
+    const engine = createPluginEngine({
+      homeDir: ws.homeDir,
+      configDir: ws.configDir,
+      workspaceDir: ws.workspaceDir,
+    });
+
+    const rootMkt = makeAbsolutePath(path.join(ws.root, "root-plugin-mkt"));
+    await writeText(
+      path.join(rootMkt, ".antigravity-plugin", "marketplace.json"),
+      JSON.stringify({
+        plugins: [
+          { name: "dot-plugin", source: "." },
+          { name: "dot-slash-plugin", source: "./" },
+          { name: "abs-local", source: { source: "local", path: "/etc" } },
+          { name: "abs-dir", source: { source: "directory", path: "/tmp" } },
+          { name: "rel-local", source: { source: "local", path: "./plugins/contained" } },
+        ],
+      }),
+    );
+    await writeText(
+      path.join(rootMkt, "plugin.json"),
+      JSON.stringify({ name: "dot-plugin", version: "2.1.0" }),
+    );
+    await writeText(
+      path.join(rootMkt, "skills", "root-skill", "SKILL.md"),
+      "---\nname: root-skill\ndescription: Lives at marketplace root\n---\n",
+    );
+    await writeText(
+      path.join(rootMkt, "plugins", "contained", "plugin.json"),
+      JSON.stringify({ name: "rel-local", version: "0.5.0" }),
+    );
+
+    const mktId = makeMarketplaceId("root-plugin-mkt");
+    const added = await engine.addMarketplace({
+      source: { kind: "local-folder", path: rootMkt },
+      id: mktId,
+    });
+    assert.equal(added.ok, true);
+    if (added.ok) {
+      const dotEntry = added.snapshot.catalogById.get(
+        makeCatalogEntryId(mktId, makePluginDirName("dot-plugin")),
+      );
+      const dotSlashEntry = added.snapshot.catalogById.get(
+        makeCatalogEntryId(mktId, makePluginDirName("dot-slash-plugin")),
+      );
+      const relLocalEntry = added.snapshot.catalogById.get(
+        makeCatalogEntryId(mktId, makePluginDirName("rel-local")),
+      );
+      assert.ok(dotEntry !== undefined);
+      assert.deepEqual(dotEntry.installSource, { kind: "marketplace-root", marketplaceId: mktId });
+      assert.equal(dotEntry.componentCounts?.skills, 1);
+      assert.ok(dotSlashEntry !== undefined);
+      assert.deepEqual(dotSlashEntry.installSource, { kind: "marketplace-root", marketplaceId: mktId });
+      assert.ok(relLocalEntry !== undefined);
+      assert.equal(relLocalEntry.installSource.kind, "marketplace-subdir");
+
+      assert.equal(
+        added.snapshot.catalog.some((e) => e.name === "abs-local" || e.name === "abs-dir"),
+        false,
+      );
+      const travDiags = added.snapshot.diagnostics.filter(
+        (d) => d.detail.kind === "path-traversal-rejected",
+      );
+      assert.equal(travDiags.length, 2);
+    }
+
+    const instRoot = await engine.install({
+      target: {
+        kind: "catalog-entry",
+        entryId: makeCatalogEntryId(mktId, makePluginDirName("dot-plugin")),
+      },
+      scope: "user",
+    });
+    assert.equal(instRoot.ok, true);
+    if (instRoot.ok) {
+      const rec = instRoot.snapshot.installedById.get(instRoot.report.pluginId);
+      assert.ok(rec !== undefined && rec.kind === "valid");
+      assert.equal(rec.manifest.version, "2.1.0");
+      assert.equal(rec.components.counts.skills, 1);
+    }
+  });
+
+  it("ignores ${CLAUDE_PLUGIN_ROOT} and ${PLUGIN_ROOT} inside JSONC comments while flagging real unexpanded values", async () => {
+    const ws = await makeTempWorkspace();
+    const engine = createPluginEngine({
+      homeDir: ws.homeDir,
+      configDir: ws.configDir,
+      workspaceDir: ws.workspaceDir,
+    });
+
+    const commentedDir = path.join(ws.configDir, "plugins", "commented-plugin");
+    await writeText(
+      path.join(commentedDir, "plugin.json"),
+      JSON.stringify({ name: "commented-plugin", version: "1.0.0" }),
+    );
+    await writeText(
+      path.join(commentedDir, "hooks.json"),
+      [
+        "{",
+        "  // Expanded from ${CLAUDE_PLUGIN_ROOT} and ${PLUGIN_ROOT}",
+        '  "PreToolUse": [{ "hooks": [{ "type": "command", "command": "/abs/guard.sh" }] }]',
+        "}",
+      ].join("\n"),
+    );
+    await writeText(
+      path.join(commentedDir, "mcp_config.json"),
+      [
+        "{",
+        "  /* Previously used ${CLAUDE_PLUGIN_ROOT}/srv.js */",
+        '  "mcpServers": { "srv": { "command": "node", "args": ["/abs/srv.js"] } }',
+        "}",
+      ].join("\n"),
+    );
+
+    const realUnexpandedDir = path.join(ws.configDir, "plugins", "real-unexpanded");
+    await writeText(
+      path.join(realUnexpandedDir, "plugin.json"),
+      JSON.stringify({ name: "real-unexpanded", version: "1.0.0" }),
+    );
+    await writeText(
+      path.join(realUnexpandedDir, "hooks.json"),
+      JSON.stringify({
+        PreToolUse: [{ hooks: [{ type: "command", command: "${CLAUDE_PLUGIN_ROOT}/guard.sh" }] }],
+      }),
+    );
+
+    const snap = await engine.snapshot();
+    const commentedId = makeInstalledPluginId("user", makePluginDirName("commented-plugin"));
+    const realId = makeInstalledPluginId("user", makePluginDirName("real-unexpanded"));
+
+    assert.equal(
+      snap.diagnostics.some(
+        (d) =>
+          d.subject.kind === "installed" &&
+          d.subject.pluginId === commentedId &&
+          d.detail.kind === "unexpanded-plugin-root",
+      ),
+      false,
+    );
+    assert.equal(
+      snap.diagnostics.some(
+        (d) =>
+          d.subject.kind === "installed" &&
+          d.subject.pluginId === realId &&
+          d.detail.kind === "unexpanded-plugin-root",
+      ),
+      true,
+    );
+  });
+});
+
 describe("Architecture boundary: engine/internal isolation", () => {
   it("forbids any file outside src/engine/ from importing src/engine/internal/*", async () => {
     const cliRoot = path.resolve(import.meta.dirname, "..");

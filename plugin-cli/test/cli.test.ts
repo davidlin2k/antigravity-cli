@@ -678,13 +678,38 @@ describe("CLI subcommands, global flags, JSON envelopes, and exit codes", () => 
       ["uninstall", "user:pstack", "--scope", "project"],
       ["marketplace", "unknown"],
       ["--json", "unknown"],
+      ["--json", "list", "--config-dir"],
+      ["--config-dir", "--json"],
     ];
     for (const args of badCalls) {
       const hBad = createCliHarness();
       assert.equal(await hBad.exec(args), 2, `expected exit 2 for: ${args.join(" ")}`);
       if (args.includes("--json")) {
-        assert.equal(JSON.parse(hBad.getStdout()).ok, false);
+        const envelope = JSON.parse(hBad.getStdout());
+        assert.equal(envelope.ok, false);
+        assert.equal(hBad.getStderr(), "");
       }
     }
+
+    const hDashList = createCliHarness();
+    assert.equal(await hDashList.exec(["--", "list"]), 0);
+    assert.match(hDashList.getStdout(), /user:pstack/);
+
+    const hJsonDashList = createCliHarness();
+    assert.equal(await hJsonDashList.exec(["--json", "--", "list"]), 0);
+    assert.equal(JSON.parse(hJsonDashList.getStdout()).data.total, 1);
+
+    const hDashMkt = createCliHarness();
+    assert.equal(await hDashMkt.exec(["--json", "marketplace", "--", "list"]), 0);
+    assert.equal(JSON.parse(hDashMkt.getStdout()).data.total, 1);
+
+    const hDashMktRoot = createCliHarness();
+    assert.equal(await hDashMktRoot.exec(["--", "marketplace", "list"]), 0);
+    assert.match(hDashMktRoot.getStdout(), /cursor-plugins/);
+
+    const hJsonAfterDash = createCliHarness();
+    assert.equal(await hJsonAfterDash.exec(["--", "--json"]), 2);
+    assert.equal(hJsonAfterDash.getStdout(), "");
+    assert.match(hJsonAfterDash.getStderr(), /Unknown flag/);
   });
 });

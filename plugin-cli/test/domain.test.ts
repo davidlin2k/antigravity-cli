@@ -420,7 +420,10 @@ describe("branded primitives and boundary parsers", () => {
 
     assert.equal(isSshGitUrl("git@github.com:cursor/plugins.git"), true);
     assert.equal(isSshGitUrl("git@gitlab.internal.corp:team/sub/repo"), true);
+    assert.equal(isSshGitUrl("git@custom_host:org/plugins.git"), true);
+    assert.equal(isSshGitUrl("ssh://git@custom_host:2222/org/plugins.git"), true);
     assert.equal(isSshGitUrl("ssh://git@gitlab.example.com:2222/org/plugins.git"), true);
+    assert.equal(isSshGitUrl("git@-badhost:org/plugins.git"), false);
     assert.equal(isSshGitUrl("git@github.com:../etc/passwd"), false);
     assert.equal(isSshGitUrl("ssh://git@github.com/org/../secret"), false);
     assert.equal(isSshGitUrl("git@github.com:"), false);
@@ -457,6 +460,23 @@ describe("parseMarketplaceInput, deriveMarketplaceId, and formatMarketplaceSourc
       ok: true,
       value: { kind: "github", owner: "cursor", repo: "plugins", ref: "main" },
     });
+
+    const withSlashBranch = parseMarketplaceInput({
+      raw: "owner/repo@feature/branch",
+      cwd: TEST_CWD,
+      homeDir: TEST_HOME,
+    });
+    assert.deepEqual(withSlashBranch, {
+      ok: true,
+      value: { kind: "github", owner: "owner", repo: "repo", ref: "feature/branch" },
+    });
+
+    const withTraversalRef = parseMarketplaceInput({
+      raw: "owner/repo@feature/../escape",
+      cwd: TEST_CWD,
+      homeDir: TEST_HOME,
+    });
+    assert.equal(withTraversalRef.ok, false);
 
     const treeUrl = parseMarketplaceInput({
       raw: "https://github.com/cursor/plugins/tree/main/pstack",
@@ -517,6 +537,16 @@ describe("parseMarketplaceInput, deriveMarketplaceId, and formatMarketplaceSourc
       value: { kind: "ssh", url: "git@github.com:cursor/plugins.git", ref: "v2.0" },
     });
 
+    const scpUnderscoreHost = parseMarketplaceInput({
+      raw: "git@custom_host:org/plugins.git",
+      cwd: TEST_CWD,
+      homeDir: TEST_HOME,
+    });
+    assert.deepEqual(scpUnderscoreHost, {
+      ok: true,
+      value: { kind: "ssh", url: "git@custom_host:org/plugins.git" },
+    });
+
     const sshScheme = parseMarketplaceInput({
       raw: "ssh://git@gitlab.example.com:2222/team/plugins.git#release",
       cwd: TEST_CWD,
@@ -555,6 +585,22 @@ describe("parseMarketplaceInput, deriveMarketplaceId, and formatMarketplaceSourc
     });
     if (httpsGit.ok) {
       assert.equal(deriveMarketplaceId(httpsGit.value), "org-plugins");
+    }
+
+    const httpsGitTrailingSlash = parseMarketplaceInput({
+      raw: "https://gitlab.example.com/org/plugins.git/",
+      cwd: TEST_CWD,
+      homeDir: TEST_HOME,
+    });
+    assert.deepEqual(httpsGitTrailingSlash, {
+      ok: true,
+      value: {
+        kind: "https-git",
+        url: "https://gitlab.example.com/org/plugins.git/",
+      },
+    });
+    if (httpsGitTrailingSlash.ok) {
+      assert.equal(deriveMarketplaceId(httpsGitTrailingSlash.value), "org-plugins");
     }
 
     const httpsJson = parseMarketplaceInput({
@@ -746,6 +792,24 @@ describe("parseInstallTarget", () => {
           owner: "cursor",
           repo: "plugins",
           ref: "v1.0",
+        },
+      },
+    });
+
+    const githubWithSlashBranch = parseInstallTarget({
+      raw: "owner/repo@feature/branch",
+      cwd: TEST_CWD,
+      homeDir: TEST_HOME,
+    });
+    assert.deepEqual(githubWithSlashBranch, {
+      ok: true,
+      value: {
+        kind: "direct-source",
+        source: {
+          kind: "github",
+          owner: "owner",
+          repo: "repo",
+          ref: "feature/branch",
         },
       },
     });

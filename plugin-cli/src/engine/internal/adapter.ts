@@ -28,8 +28,11 @@ import {
 import {
   BACKUP_PREFIX,
   STAGING_PREFIX,
+  checkContainedPath,
   errorMessage,
   isRecord,
+  isWithinCanonicalRoot,
+  resolvePossiblyDanglingTarget,
   writeJsonAtomic,
 } from "./stores.ts";
 
@@ -39,6 +42,8 @@ export interface AdaptInstallInput {
   readonly scope: InstallScope;
   readonly dirName: PluginDirName;
   readonly fallbackName?: string;
+  readonly fallbackVersion?: string;
+  readonly disabled?: boolean;
 }
 
 export type AdaptInstallResult =
@@ -57,14 +62,11 @@ export type AdaptInstallResult =
 
 export type ToggleManifestResult =
   | { readonly ok: true; readonly outcome: "changed" | "unchanged" }
+  | { readonly ok: false; readonly kind: "path-traversal"; readonly offendingPath: string }
   | { readonly ok: false; readonly kind: "bundle-invalid"; readonly diagnostics: NonEmpty<Diagnostic> }
   | { readonly ok: false; readonly kind: "io-failed"; readonly operation: string; readonly reason: string };
 
 const PLUGIN_ROOT_REPLACE_RE = /\$\{(?:CLAUDE_PLUGIN_ROOT|PLUGIN_ROOT)\}/g;
-
-function isWithinRoot(resolved: string, canonicalRoot: string): boolean {
-  return resolved === canonicalRoot || resolved.startsWith(`${canonicalRoot}${path.sep}`);
-}
 
 function expandPluginRootInValue(
   value: unknown,
@@ -113,7 +115,7 @@ async function copyDirectorySafely(input: {
   readonly currentDest: AbsolutePath;
   readonly canonicalSourceRoot: string;
   readonly relPrefix: string;
-  readonly visitedRealDirs: Set<string>;
+  readonly ancestorRealDirs: ReadonlySet<string>;
 }): Promise<
   | { readonly ok: true }
   | { readonly ok: false; readonly kind: "path-traversal"; readonly offendingPath: string }
@@ -141,23 +143,24 @@ async function copyDirectorySafely(input: {
         targetStat = await fs.stat(srcPath);
       } catch {
         const rawLink = await fs.readlink(srcPath);
-        resolved = path.resolve(path.dirname(srcPath), rawLink);
+        resolved = await resolvePossiblyDanglingTarget(input.currentSrc, rawLink);
       }
-      if (!isWithinRoot(resolved, input.canonicalSourceRoot)) {
+      if (!isWithinCanonicalRoot(resolved, input.canonicalSourceRoot)) {
         return { ok: false, kind: "path-traversal", offendingPath: relPath };
       }
       if (targetStat === null) {
         continue;
       }
       if (targetStat.isDirectory()) {
-        if (!input.visitedRealDirs.has(resolved)) {
-          input.visitedRealDirs.add(resolved);
+        if (!input.ancestorRealDirs.has(resolved)) {
+          const nextAncestors = new Set(input.ancestorRealDirs);
+          nextAncestors.add(resolved);
           const nested = await copyDirectorySafely({
-            currentSrc: srcPath,
+            currentSrc: makeAbsolutePath(resolved),
             currentDest: destPath,
             canonicalSourceRoot: input.canonicalSourceRoot,
             relPrefix: relPath,
-            visitedRealDirs: input.visitedRealDirs,
+            ancestorRealDirs: nextAncestors,
           });
           if (!nested.ok) {
             return nested;
@@ -175,17 +178,18 @@ async function copyDirectorySafely(input: {
 
     if (lstat.isDirectory()) {
       const realDir = await fs.realpath(srcPath);
-      if (!isWithinRoot(realDir, input.canonicalSourceRoot)) {
+      if (!isWithinCanonicalRoot(realDir, input.canonicalSourceRoot)) {
         return { ok: false, kind: "path-traversal", offendingPath: relPath };
       }
-      if (!input.visitedRealDirs.has(realDir)) {
-        input.visitedRealDirs.add(realDir);
+      if (!input.ancestorRealDirs.has(realDir)) {
+        const nextAncestors = new Set(input.ancestorRealDirs);
+        nextAncestors.add(realDir);
         const nested = await copyDirectorySafely({
-          currentSrc: srcPath,
+          currentSrc: makeAbsolutePath(realDir),
           currentDest: destPath,
           canonicalSourceRoot: input.canonicalSourceRoot,
           relPrefix: relPath,
-          visitedRealDirs: input.visitedRealDirs,
+          ancestorRealDirs: nextAncestors,
         });
         if (!nested.ok) {
           return nested;
@@ -246,11 +250,11 @@ export async function adaptAndInstallBundle(
     const canonicalSourceRoot = await fs.realpath(sourceDir);
 
     const copyResult = await copyDirectorySafely({
-      currentSrc: sourceDir,
+      currentSrc: makeAbsolutePath(canonicalSourceRoot),
       currentDest: stageDir,
       canonicalSourceRoot,
       relPrefix: "",
-      visitedRealDirs: new Set<string>([canonicalSourceRoot]),
+      ancestorRealDirs: new Set<string>([canonicalSourceRoot]),
     });
     if (!copyResult.ok) {
       await cleanupStage();
@@ -334,6 +338,17 @@ export async function adaptAndInstallBundle(
       };
     }
 
+    const effectiveVersion =
+      normalized.manifest.version ??
+      (input.fallbackVersion !== undefined && input.fallbackVersion.trim().length > 0
+        ? input.fallbackVersion.trim()
+        : undefined);
+    const finalManifest: NormalizedPluginManifest = {
+      ...normalized.manifest,
+      ...(effectiveVersion !== undefined ? { version: effectiveVersion } : {}),
+      ...(input.disabled === true ? { disabled: true } : {}),
+    };
+
     const rootManifestPath = joinAbsolutePath(stageDir, makeRelativeSubpath("plugin.json"));
     if (
       foundManifest.path !== rootManifestPath &&
@@ -342,7 +357,7 @@ export async function adaptAndInstallBundle(
     ) {
       await fs.rm(foundManifest.path, { force: true });
     }
-    await writeJsonAtomic(rootManifestPath, normalized.manifest, 0o644);
+    await writeJsonAtomic(rootManifestPath, finalManifest, 0o644);
 
     let adaptedHooks = false;
     let adaptedMcp = false;
@@ -636,8 +651,25 @@ export async function toggleManifestDisabledAtomic(
   pluginId: InstalledPluginId,
   enabled: boolean,
 ): Promise<ToggleManifestResult> {
-  const found = await findPluginManifestFile(installPath);
+  let canonicalInstallRoot: string;
+  try {
+    canonicalInstallRoot = await fs.realpath(installPath);
+  } catch (err) {
+    return {
+      ok: false,
+      kind: "io-failed",
+      operation: "resolve-install-path",
+      reason: errorMessage(err),
+    };
+  }
+
   const rootManifestPath = joinAbsolutePath(installPath, makeRelativeSubpath("plugin.json"));
+  const rootCheck = await checkContainedPath(rootManifestPath, canonicalInstallRoot);
+  if (rootCheck.kind === "escaped") {
+    return { ok: false, kind: "path-traversal", offendingPath: "plugin.json" };
+  }
+
+  const found = await findPluginManifestFile(installPath);
   if (found === null) {
     return {
       ok: false,
@@ -657,6 +689,11 @@ export async function toggleManifestDisabledAtomic(
         },
       ],
     };
+  }
+
+  const manifestCheck = await checkContainedPath(found.path, canonicalInstallRoot);
+  if (manifestCheck.kind === "escaped") {
+    return { ok: false, kind: "path-traversal", offendingPath: found.relativePath };
   }
 
   let rawBytes: Uint8Array;
@@ -697,7 +734,7 @@ export async function toggleManifestDisabledAtomic(
   }
 
   const normalized = normalizeAntigravityManifest(parsed.value);
-  if (!normalized.ok) {
+  if (!normalized.ok || !isRecord(parsed.value)) {
     return {
       ok: false,
       kind: "bundle-invalid",
@@ -709,7 +746,7 @@ export async function toggleManifestDisabledAtomic(
           detail: {
             kind: "manifest-schema-invalid",
             filePath: found.path,
-            fieldErrors: normalized.fieldErrors,
+            fieldErrors: normalized.ok ? ["Manifest root must be a JSON object."] : normalized.fieldErrors,
           },
           message: `Cannot toggle "${pluginId}": invalid plugin.json.`,
           hint: "Fix the schema errors in plugin.json.",
@@ -724,10 +761,16 @@ export async function toggleManifestDisabledAtomic(
     return { ok: true, outcome: "unchanged" };
   }
 
-  const { disabled: _prevDisabled, ...withoutDisabled } = normalized.manifest;
-  const updated: NormalizedPluginManifest = targetDisabled
-    ? { ...withoutDisabled, disabled: true }
-    : withoutDisabled;
+  const updated: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(parsed.value)) {
+    if (key === "disabled") {
+      continue;
+    }
+    updated[key] = value;
+  }
+  if (targetDisabled) {
+    updated.disabled = true;
+  }
 
   try {
     if (

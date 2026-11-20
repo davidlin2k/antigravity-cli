@@ -107,6 +107,86 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export function isWithinCanonicalRoot(resolvedPath: string, canonicalRoot: string): boolean {
+  return resolvedPath === canonicalRoot || resolvedPath.startsWith(`${canonicalRoot}${path.sep}`);
+}
+
+export async function resolvePossiblyDanglingTarget(
+  canonicalStartDir: string,
+  rawTarget: string,
+  maxHops = 40,
+): Promise<string> {
+  const resolveStep = async (startDir: string, target: string, hops: number): Promise<string> => {
+    let cur = path.isAbsolute(target) ? path.parse(target).root : startDir;
+    const remainder = path.isAbsolute(target) ? target.slice(cur.length) : target;
+    const segments = remainder.split(/[\\/]+/);
+
+    for (const seg of segments) {
+      if (seg.length === 0 || seg === ".") {
+        continue;
+      }
+      if (seg === "..") {
+        cur = path.dirname(cur);
+        continue;
+      }
+      const next = path.join(cur, seg);
+      try {
+        cur = await fs.realpath(next);
+      } catch {
+        if (hops < maxHops) {
+          try {
+            const nestedLink = await fs.readlink(next);
+            cur = await resolveStep(cur, nestedLink, hops + 1);
+            continue;
+          } catch {
+            // Non-existent literal segment; keep lexical path for subsequent `..` resolution.
+          }
+        }
+        cur = next;
+      }
+    }
+    return cur;
+  };
+
+  return resolveStep(canonicalStartDir, rawTarget, 0);
+}
+
+export type ContainedPathCheck =
+  | { readonly kind: "missing" }
+  | { readonly kind: "contained"; readonly realPath: string }
+  | { readonly kind: "escaped"; readonly resolvedOutsideRoot: string };
+
+export async function checkContainedPath(
+  candidatePath: AbsolutePath,
+  canonicalRoot: string,
+): Promise<ContainedPathCheck> {
+  let lstat;
+  try {
+    lstat = await fs.lstat(candidatePath);
+  } catch {
+    return { kind: "missing" };
+  }
+  try {
+    const realPath = await fs.realpath(candidatePath);
+    if (!isWithinCanonicalRoot(realPath, canonicalRoot)) {
+      return { kind: "escaped", resolvedOutsideRoot: realPath };
+    }
+    return { kind: "contained", realPath };
+  } catch {
+    if (lstat.isSymbolicLink()) {
+      const linkRaw = await fs.readlink(candidatePath).catch(() => "");
+      const parentReal = await fs
+        .realpath(path.dirname(candidatePath))
+        .catch(() => path.dirname(candidatePath));
+      const resolved = await resolvePossiblyDanglingTarget(parentReal, linkRaw);
+      if (!isWithinCanonicalRoot(resolved, canonicalRoot)) {
+        return { kind: "escaped", resolvedOutsideRoot: resolved };
+      }
+    }
+    return { kind: "missing" };
+  }
+}
+
 export function getErrnoCode(error: unknown): string | undefined {
   if (!isRecord(error)) {
     return undefined;
@@ -433,6 +513,15 @@ function decodePluginInstallSource(raw: unknown): PluginInstallSource | null {
     return null;
   }
   switch (raw.kind) {
+    case "marketplace-root": {
+      if (typeof raw.marketplaceId !== "string" || !isMarketplaceId(raw.marketplaceId)) {
+        return null;
+      }
+      return {
+        kind: "marketplace-root",
+        marketplaceId: raw.marketplaceId,
+      };
+    }
     case "marketplace-subdir": {
       if (
         typeof raw.marketplaceId !== "string" ||
@@ -1165,8 +1254,17 @@ function extractTargetDirName(artifactName: string, prefix: string): PluginDirNa
     return null;
   }
   const lastDash = rest.lastIndexOf("-");
-  const candidate = lastDash > 0 ? rest.slice(0, lastDash) : rest;
-  return isPluginDirName(candidate) ? candidate : null;
+  if (lastDash > 0 && /^[0-9a-f]{8,}$/i.test(rest.slice(lastDash + 1))) {
+    const candidate = rest.slice(0, lastDash);
+    if (isPluginDirName(candidate)) {
+      return candidate;
+    }
+  }
+  return isPluginDirName(rest) ? rest : null;
+}
+
+async function isLockHeldByLiveProcess(lockFilePath: AbsolutePath): Promise<boolean> {
+  return !(await isLockStale(lockFilePath, DEFAULT_LOCK_STALE_MS));
 }
 
 /**
@@ -1222,6 +1320,7 @@ async function pathExists(targetPath: string): Promise<boolean> {
 export async function recoverAndCleanStagingArtifacts(
   scopeRoot: AbsolutePath,
   scope: InstallScope,
+  dirNameFilter?: PluginDirName,
   onlyPath?: AbsolutePath,
 ): Promise<readonly AbsolutePath[]> {
   const artifacts = await listStaleStagingPaths(scopeRoot, scope);
@@ -1230,6 +1329,16 @@ export async function recoverAndCleanStagingArtifacts(
   for (const artifact of artifacts) {
     if (onlyPath !== undefined && artifact.path !== onlyPath) {
       continue;
+    }
+    if (dirNameFilter !== undefined) {
+      if (artifact.targetDirName !== dirNameFilter) {
+        continue;
+      }
+    } else if (artifact.targetDirName !== null) {
+      const lockFile = targetLockPath(scopeRoot, artifact.targetDirName);
+      if (await isLockHeldByLiveProcess(lockFile)) {
+        continue;
+      }
     }
     if (artifact.artifactKind === "backup" && artifact.targetDirName !== null) {
       const targetPath = joinAbsolutePath(scopeRoot, artifact.targetDirName);

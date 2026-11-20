@@ -202,6 +202,18 @@ interface ExtractedArgs {
   readonly rest: readonly string[];
 }
 
+function hasJsonFlagBeforeSeparator(argv: readonly string[]): boolean {
+  for (const token of argv) {
+    if (token === "--") {
+      return false;
+    }
+    if (token === "--json") {
+      return true;
+    }
+  }
+  return false;
+}
+
 function extractGlobalOptions(argv: readonly string[]): ParseResult<ExtractedArgs> {
   let configDirRaw: string | undefined;
   let workspaceRaw: string | undefined;
@@ -553,7 +565,8 @@ export function parseCliArgs(
   }
   const config = configRes.value;
 
-  const subcommand = rest[0];
+  const commandTokens = rest[0] === "--" ? rest.slice(1) : rest;
+  const subcommand = commandTokens[0];
   if (subcommand === undefined) {
     return parseOk({ globals, config, command: { kind: "tui" } });
   }
@@ -562,12 +575,18 @@ export function parseCliArgs(
     return parseErr("invalid-cli-args", subcommand, `Unknown flag: ${subcommand}`);
   }
 
-  const tail = rest.slice(1);
+  const tail = commandTokens.slice(1);
 
   switch (subcommand) {
     case "tui": {
-      if (tail.length > 0) {
-        return parseErr("invalid-cli-args", tail.join(" "), `Unexpected arguments for tui: ${tail.join(" ")}`);
+      const parsed = parseCommandTokens(tail, new Set(), new Set());
+      if (!parsed.ok) return parsed;
+      if (parsed.value.positionals.length > 0) {
+        return parseErr(
+          "invalid-cli-args",
+          parsed.value.positionals.join(" "),
+          `Unexpected arguments for tui: ${parsed.value.positionals.join(" ")}`,
+        );
       }
       return parseOk({ globals, config, command: { kind: "tui" } });
     }
@@ -823,14 +842,21 @@ export function parseCliArgs(
     }
 
     case "stats": {
-      if (tail.length > 0) {
-        return parseErr("invalid-cli-args", tail.join(" "), "stats does not accept arguments or extra flags.");
+      const parsed = parseCommandTokens(tail, new Set(), new Set());
+      if (!parsed.ok) return parsed;
+      if (parsed.value.positionals.length > 0) {
+        return parseErr(
+          "invalid-cli-args",
+          parsed.value.positionals.join(" "),
+          "stats does not accept arguments or extra flags.",
+        );
       }
       return parseOk({ globals, config, command: { kind: "stats" } });
     }
 
     case "marketplace": {
-      const mktAction = tail[0];
+      const mktTokens = tail[0] === "--" ? tail.slice(1) : tail;
+      const mktAction = mktTokens[0];
       if (mktAction === undefined) {
         return parseErr(
           "invalid-cli-args",
@@ -838,7 +864,7 @@ export function parseCliArgs(
           "Expected marketplace subcommand: add | list | update | remove",
         );
       }
-      const mktTail = tail.slice(1);
+      const mktTail = mktTokens.slice(1);
       switch (mktAction) {
         case "add": {
           const parsed = parseCommandTokens(mktTail, new Set(["--id"]), new Set());
@@ -868,8 +894,14 @@ export function parseCliArgs(
           });
         }
         case "list": {
-          if (mktTail.length > 0) {
-            return parseErr("invalid-cli-args", mktTail.join(" "), "marketplace list does not take arguments.");
+          const parsed = parseCommandTokens(mktTail, new Set(), new Set());
+          if (!parsed.ok) return parsed;
+          if (parsed.value.positionals.length > 0) {
+            return parseErr(
+              "invalid-cli-args",
+              parsed.value.positionals.join(" "),
+              "marketplace list does not take arguments.",
+            );
           }
           return parseOk({ globals, config, command: { kind: "marketplace-list" } });
         }
@@ -1064,9 +1096,7 @@ export async function runCli(
   });
 
   if (!parsed.ok) {
-    const rawGlobals = extractGlobalOptions(argv);
-    const wantJson = rawGlobals.ok && rawGlobals.value.globals.json;
-    if (wantJson) {
+    if (hasJsonFlagBeforeSeparator(argv)) {
       writeJsonEnvelope(io, { ok: false, error: parsed.error });
     } else {
       io.stderr(`Error (${parsed.error.code}): ${parsed.error.message}\n`);

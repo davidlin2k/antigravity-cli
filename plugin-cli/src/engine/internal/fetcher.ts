@@ -304,8 +304,9 @@ async function persistSyncFailure(input: {
   readonly marketplaceId: MarketplaceId;
   readonly previous: PersistedSyncCache | null;
   readonly reason: string;
+  readonly extraDiagnostics?: readonly Diagnostic[];
 }): Promise<MarketplaceSyncOutcome> {
-  const { paths, marketplaceId, previous, reason } = input;
+  const { paths, marketplaceId, previous, reason, extraDiagnostics } = input;
   const attemptedAt = makeIsoTimestamp();
   const lastGoodSyncAt =
     previous === null
@@ -317,6 +318,16 @@ async function persistSyncFailure(input: {
           : null;
 
   const preservedEntries = previous?.entries ?? [];
+  const diagnostics: Diagnostic[] = [buildSyncFailedDiagnostic(marketplaceId, reason)];
+  if (extraDiagnostics !== undefined) {
+    const seen = new Set(diagnostics.map((d) => d.id));
+    for (const diag of extraDiagnostics) {
+      if (!seen.has(diag.id)) {
+        seen.add(diag.id);
+        diagnostics.push(diag);
+      }
+    }
+  }
   const nextCache: PersistedSyncCache = {
     schemaVersion: 1,
     marketplaceId,
@@ -329,7 +340,7 @@ async function persistSyncFailure(input: {
     localMirrorPath: previous?.localMirrorPath ?? null,
     sourceMtimeMs: previous?.sourceMtimeMs ?? null,
     entries: preservedEntries,
-    diagnostics: [buildSyncFailedDiagnostic(marketplaceId, reason)],
+    diagnostics,
   };
 
   await saveSyncCache(paths, nextCache);
@@ -401,6 +412,7 @@ export async function syncSingleMarketplace(
             marketplaceId: entry.id,
             previous,
             reason,
+            extraDiagnostics: normalized.diagnostics,
           });
         }
         const cache: PersistedSyncCache = {
@@ -474,6 +486,7 @@ export async function syncSingleMarketplace(
               marketplaceId: entry.id,
               previous,
               reason,
+              extraDiagnostics: normalized.diagnostics,
             });
           }
           const cache: PersistedSyncCache = {
@@ -533,6 +546,7 @@ export async function syncSingleMarketplace(
             marketplaceId: entry.id,
             previous,
             reason,
+            extraDiagnostics: normalized.diagnostics,
           });
         }
 
@@ -584,6 +598,7 @@ export async function syncSingleMarketplace(
             marketplaceId: entry.id,
             previous,
             reason,
+            extraDiagnostics: normalized.diagnostics,
           });
         }
         const cache: PersistedSyncCache = {
@@ -648,6 +663,7 @@ export async function syncSingleMarketplace(
             marketplaceId: entry.id,
             previous,
             reason,
+            extraDiagnostics: normalized.diagnostics,
           });
         }
         const cache: PersistedSyncCache = {
@@ -822,7 +838,12 @@ export async function materializeInstallSource(input: {
   const { installSource } = input;
 
   switch (installSource.kind) {
+    case "marketplace-root":
     case "marketplace-subdir": {
+      const opName =
+        installSource.kind === "marketplace-root"
+          ? "materialize-marketplace-root"
+          : "materialize-marketplace-subdir";
       const mkt = input.marketplaces.find((m) => m.id === installSource.marketplaceId);
       const cache = input.syncCaches.get(installSource.marketplaceId) ?? null;
 
@@ -834,7 +855,7 @@ export async function materializeInstallSource(input: {
         return {
           ok: false,
           kind: "io-failed",
-          operation: "materialize-marketplace-subdir",
+          operation: opName,
           reason: `Marketplace "${installSource.marketplaceId}" has no local mirror or folder on disk. Run marketplace update first.`,
         };
       }
@@ -848,30 +869,53 @@ export async function materializeInstallSource(input: {
         mkt.source.subdir !== undefined
       ) {
         effectiveBase = joinAbsolutePath(baseDir, mkt.source.subdir);
+        let canonicalMirror: string;
+        try {
+          canonicalMirror = await fs.realpath(baseDir);
+        } catch (err) {
+          return {
+            ok: false,
+            kind: "io-failed",
+            operation: opName,
+            reason: errorMessage(err),
+          };
+        }
+        if (!(await isInsideCanonicalDir(effectiveBase, canonicalMirror))) {
+          return { ok: false, kind: "path-traversal", offendingPath: mkt.source.subdir };
+        }
       }
 
-      const sourceDir = joinAbsolutePath(effectiveBase, installSource.subdir);
-      let canonicalBase: string;
-      try {
-        canonicalBase = await fs.realpath(effectiveBase);
-      } catch (err) {
-        return {
-          ok: false,
-          kind: "io-failed",
-          operation: "materialize-marketplace-subdir",
-          reason: errorMessage(err),
-        };
+      const sourceDir =
+        installSource.kind === "marketplace-root"
+          ? effectiveBase
+          : joinAbsolutePath(effectiveBase, installSource.subdir);
+      if (installSource.kind === "marketplace-subdir") {
+        let canonicalBase: string;
+        try {
+          canonicalBase = await fs.realpath(effectiveBase);
+        } catch (err) {
+          return {
+            ok: false,
+            kind: "io-failed",
+            operation: opName,
+            reason: errorMessage(err),
+          };
+        }
+        if (!(await isInsideCanonicalDir(sourceDir, canonicalBase))) {
+          return { ok: false, kind: "path-traversal", offendingPath: installSource.subdir };
+        }
       }
-      if (!(await isInsideCanonicalDir(sourceDir, canonicalBase))) {
-        return { ok: false, kind: "path-traversal", offendingPath: installSource.subdir };
-      }
+
       const stat = await fs.stat(sourceDir).catch(() => null);
       if (stat === null || !stat.isDirectory()) {
         return {
           ok: false,
           kind: "io-failed",
-          operation: "materialize-marketplace-subdir",
-          reason: `Plugin directory "${installSource.subdir}" not found in marketplace "${installSource.marketplaceId}".`,
+          operation: opName,
+          reason:
+            installSource.kind === "marketplace-root"
+              ? `Marketplace root directory not found for "${installSource.marketplaceId}".`
+              : `Plugin directory "${installSource.subdir}" not found in marketplace "${installSource.marketplaceId}".`,
         };
       }
       const resolvedSha =

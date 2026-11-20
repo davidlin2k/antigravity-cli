@@ -15,7 +15,6 @@ import {
   makeHttpUrl,
   makePluginDirName,
   makeRelativeSubpath,
-  parseAbsolutePath,
   parseHttpUrl,
   parsePluginName,
   parseRelativeSubpath,
@@ -43,7 +42,7 @@ import type {
   RuleSummary,
   SkillSummary,
 } from "../../domain/types.ts";
-import { isRecord } from "./stores.ts";
+import { checkContainedPath, isRecord, isWithinCanonicalRoot } from "./stores.ts";
 
 export type JsoncParseResult =
   | { readonly ok: true; readonly value: unknown; readonly hadUtf8Bom: boolean }
@@ -101,6 +100,16 @@ export interface CatalogNormalizationResult {
 
 const ARCHIVE_EXT_RE = /\.(?:tar\.gz|tgz|zip)$/i;
 const GITHUB_REPO_PAIR_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}\/[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$/;
+const WINDOWS_DRIVE_RE = /^[a-zA-Z]:/;
+
+function isCurrentDirPath(raw: string): boolean {
+  const slashed = raw.trim().replaceAll("\\", "/");
+  if (slashed.length === 0 || slashed.startsWith("/")) {
+    return false;
+  }
+  const segments = slashed.split("/");
+  return segments.some((seg) => seg === ".") && segments.every((seg) => seg === "" || seg === ".");
+}
 
 function lineColAtOffset(text: string, offset: number): { readonly line: number; readonly column: number } {
   const clamped = Math.max(0, Math.min(offset, text.length));
@@ -880,7 +889,7 @@ export function extractAgentsFromJson(rawValue: unknown): readonly AgentSummary[
 async function isInsideCanonicalRoot(candidatePath: string, canonicalRoot: string): Promise<boolean> {
   try {
     const resolved = await fs.realpath(candidatePath);
-    return resolved === canonicalRoot || resolved.startsWith(`${canonicalRoot}${path.sep}`);
+    return isWithinCanonicalRoot(resolved, canonicalRoot);
   } catch {
     return false;
   }
@@ -890,6 +899,7 @@ async function collectRuleFiles(
   rulesRoot: AbsolutePath,
   canonicalPluginRoot: string,
   relPrefix: string,
+  ancestorRealDirs: ReadonlySet<string>,
   out: RuleSummary[],
 ): Promise<void> {
   let entries;
@@ -901,13 +911,31 @@ async function collectRuleFiles(
   entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   for (const entry of entries) {
     const full = makeAbsolutePath(path.join(rulesRoot, entry.name));
-    if (!(await isInsideCanonicalRoot(full, canonicalPluginRoot))) {
+    let realTarget: string;
+    let stat;
+    try {
+      realTarget = await fs.realpath(full);
+      if (!isWithinCanonicalRoot(realTarget, canonicalPluginRoot)) {
+        continue;
+      }
+      stat = await fs.stat(realTarget);
+    } catch {
       continue;
     }
     const relStr = `${relPrefix}/${entry.name}`;
-    if (entry.isDirectory()) {
-      await collectRuleFiles(full, canonicalPluginRoot, relStr, out);
-    } else if (entry.name.toLowerCase().endsWith(".md")) {
+    if (stat.isDirectory()) {
+      if (!ancestorRealDirs.has(realTarget)) {
+        const nextAncestors = new Set(ancestorRealDirs);
+        nextAncestors.add(realTarget);
+        await collectRuleFiles(
+          makeAbsolutePath(realTarget),
+          canonicalPluginRoot,
+          relStr,
+          nextAncestors,
+          out,
+        );
+      }
+    } else if (stat.isFile() && entry.name.toLowerCase().endsWith(".md")) {
       const parsedRel = parseRelativeSubpath(relStr);
       if (parsedRel.ok) {
         out.push({
@@ -1018,7 +1046,16 @@ export async function previewPluginComponents(
   const rules: RuleSummary[] = [];
   const rulesDir = makeAbsolutePath(path.join(pluginDir, "rules"));
   if (await isInsideCanonicalRoot(rulesDir, canonicalRoot)) {
-    await collectRuleFiles(rulesDir, canonicalRoot, "rules", rules);
+    const realRulesDir = await fs.realpath(rulesDir).catch(() => null);
+    if (realRulesDir !== null) {
+      await collectRuleFiles(
+        makeAbsolutePath(realRulesDir),
+        canonicalRoot,
+        "rules",
+        new Set<string>([canonicalRoot, realRulesDir]),
+        rules,
+      );
+    }
   }
 
   let hooks: readonly HookSummary[] = [];
@@ -1244,22 +1281,88 @@ function normalizeDirectoryCacheListings(
   return entries;
 }
 
+type ResolvePluginSourceResult =
+  | { readonly ok: true; readonly source: PluginInstallSource }
+  | { readonly ok: false; readonly kind: "skip" }
+  | { readonly ok: false; readonly kind: "invalid"; readonly reason: string }
+  | {
+      readonly ok: false;
+      readonly kind: "path-traversal";
+      readonly offendingPath: string;
+      readonly resolvedOutsideRoot: string;
+      readonly reason: string;
+    };
+
+async function resolveRelativeSubdirWithPrefix(input: {
+  readonly subpath: RelativeSubpath;
+  readonly pluginRootPrefix: RelativeSubpath | null;
+  readonly rootDir: AbsolutePath | undefined;
+  readonly canonicalRootDir: string | null;
+}): Promise<RelativeSubpath> {
+  const { subpath, pluginRootPrefix, rootDir, canonicalRootDir } = input;
+  if (
+    pluginRootPrefix === null ||
+    subpath === pluginRootPrefix ||
+    subpath.startsWith(`${pluginRootPrefix}/`)
+  ) {
+    return subpath;
+  }
+  const combined = parseRelativeSubpath(`${pluginRootPrefix}/${subpath}`);
+  if (!combined.ok) {
+    return subpath;
+  }
+  if (rootDir === undefined) {
+    return combined.value;
+  }
+  const directPath = joinAbsolutePath(rootDir, subpath);
+  const prefixedPath = joinAbsolutePath(rootDir, combined.value);
+  if (canonicalRootDir !== null) {
+    const directCheck = await checkContainedPath(directPath, canonicalRootDir);
+    if (directCheck.kind === "escaped") {
+      return subpath;
+    }
+    const directExists =
+      directCheck.kind === "contained" &&
+      (await fs
+        .stat(directCheck.realPath)
+        .then((s) => s.isDirectory())
+        .catch(() => false));
+    if (directExists) {
+      return subpath;
+    }
+    const prefixedCheck = await checkContainedPath(prefixedPath, canonicalRootDir);
+    const prefixedExists =
+      prefixedCheck.kind === "contained" &&
+      (await fs
+        .stat(prefixedCheck.realPath)
+        .then((s) => s.isDirectory())
+        .catch(() => false));
+    return prefixedExists ? combined.value : subpath;
+  }
+  const directExists = await fs
+    .stat(directPath)
+    .then((s) => s.isDirectory())
+    .catch(() => false);
+  const prefixedExists = await fs
+    .stat(prefixedPath)
+    .then((s) => s.isDirectory())
+    .catch(() => false);
+  return !directExists && prefixedExists ? combined.value : subpath;
+}
+
 async function resolveMarketplacePluginSource(input: {
   readonly rawSource: unknown;
   readonly marketplaceId: MarketplaceId;
   readonly pluginRootPrefix: RelativeSubpath | null;
   readonly rootDir: AbsolutePath | undefined;
-}): Promise<
-  | { readonly ok: true; readonly source: PluginInstallSource }
-  | { readonly ok: false; readonly skip: true }
-  | { readonly ok: false; readonly skip: false; readonly reason: string }
-> {
-  const { rawSource, marketplaceId, pluginRootPrefix, rootDir } = input;
+  readonly canonicalRootDir: string | null;
+}): Promise<ResolvePluginSourceResult> {
+  const { rawSource, marketplaceId, pluginRootPrefix, rootDir, canonicalRootDir } = input;
 
   if (typeof rawSource === "string") {
     const trimmed = rawSource.trim();
     if (trimmed.length === 0) {
-      return { ok: false, skip: false, reason: "Plugin source string cannot be empty." };
+      return { ok: false, kind: "invalid", reason: "Plugin source string cannot be empty." };
     }
     if (isHttpUrl(trimmed)) {
       if (ARCHIVE_EXT_RE.test(trimmed)) {
@@ -1270,29 +1373,21 @@ async function resolveMarketplacePluginSource(input: {
     if (isSshGitUrl(trimmed)) {
       return { ok: true, source: { kind: "git-repo", repoUrl: trimmed } };
     }
+    if (isCurrentDirPath(trimmed)) {
+      return { ok: true, source: { kind: "marketplace-root", marketplaceId } };
+    }
 
     const parsedSubpath = parseRelativeSubpath(trimmed);
     if (!parsedSubpath.ok) {
-      return { ok: false, skip: false, reason: parsedSubpath.error.message };
+      return { ok: false, kind: "invalid", reason: parsedSubpath.error.message };
     }
 
-    let finalSubpath = parsedSubpath.value;
-    if (pluginRootPrefix !== null && !finalSubpath.startsWith(`${pluginRootPrefix}/`) && finalSubpath !== pluginRootPrefix) {
-      const combined = parseRelativeSubpath(`${pluginRootPrefix}/${finalSubpath}`);
-      if (combined.ok) {
-        if (rootDir !== undefined) {
-          const directPath = joinAbsolutePath(rootDir, finalSubpath);
-          const prefixedPath = joinAbsolutePath(rootDir, combined.value);
-          const directExists = await fs.stat(directPath).then((s) => s.isDirectory()).catch(() => false);
-          const prefixedExists = await fs.stat(prefixedPath).then((s) => s.isDirectory()).catch(() => false);
-          if (!directExists && prefixedExists) {
-            finalSubpath = combined.value;
-          }
-        } else {
-          finalSubpath = combined.value;
-        }
-      }
-    }
+    const finalSubpath = await resolveRelativeSubdirWithPrefix({
+      subpath: parsedSubpath.value,
+      pluginRootPrefix,
+      rootDir,
+      canonicalRootDir,
+    });
 
     return {
       ok: true,
@@ -1305,7 +1400,7 @@ async function resolveMarketplacePluginSource(input: {
   }
 
   if (!isRecord(rawSource) || typeof rawSource.source !== "string") {
-    return { ok: false, skip: false, reason: "Plugin entry is missing a valid 'source' field." };
+    return { ok: false, kind: "invalid", reason: "Plugin entry is missing a valid 'source' field." };
   }
 
   const ref = typeof rawSource.ref === "string" && rawSource.ref.trim().length > 0 ? rawSource.ref.trim() : undefined;
@@ -1314,15 +1409,15 @@ async function resolveMarketplacePluginSource(input: {
   switch (rawSource.source) {
     case "git-subdir": {
       if (typeof rawSource.url !== "string" || typeof rawSource.path !== "string") {
-        return { ok: false, skip: false, reason: "git-subdir source requires 'url' and 'path'." };
+        return { ok: false, kind: "invalid", reason: "git-subdir source requires 'url' and 'path'." };
       }
       const repoUrl = parseRemoteGitUrl(rawSource.url);
       if (repoUrl === null) {
-        return { ok: false, skip: false, reason: `Invalid git-subdir URL: "${rawSource.url}".` };
+        return { ok: false, kind: "invalid", reason: `Invalid git-subdir URL: "${rawSource.url}".` };
       }
       const parsedPath = parseRelativeSubpath(rawSource.path);
       if (!parsedPath.ok) {
-        return { ok: false, skip: false, reason: parsedPath.error.message };
+        return { ok: false, kind: "invalid", reason: parsedPath.error.message };
       }
       return {
         ok: true,
@@ -1337,16 +1432,16 @@ async function resolveMarketplacePluginSource(input: {
     }
     case "url": {
       if (typeof rawSource.url !== "string") {
-        return { ok: false, skip: false, reason: "url source requires 'url'." };
+        return { ok: false, kind: "invalid", reason: "url source requires 'url'." };
       }
       const repoUrl = parseRemoteGitUrl(rawSource.url);
       if (repoUrl === null) {
-        return { ok: false, skip: false, reason: `Invalid source URL: "${rawSource.url}".` };
+        return { ok: false, kind: "invalid", reason: `Invalid source URL: "${rawSource.url}".` };
       }
       if (typeof rawSource.path === "string" && rawSource.path.trim().length > 0) {
         const parsedPath = parseRelativeSubpath(rawSource.path);
         if (!parsedPath.ok) {
-          return { ok: false, skip: false, reason: parsedPath.error.message };
+          return { ok: false, kind: "invalid", reason: parsedPath.error.message };
         }
         return {
           ok: true,
@@ -1385,13 +1480,13 @@ async function resolveMarketplacePluginSource(input: {
     }
     case "github": {
       if (typeof rawSource.repo !== "string" || !GITHUB_REPO_PAIR_RE.test(rawSource.repo.trim())) {
-        return { ok: false, skip: false, reason: `Invalid GitHub repo specifier: "${String(rawSource.repo)}".` };
+        return { ok: false, kind: "invalid", reason: `Invalid GitHub repo specifier: "${String(rawSource.repo)}".` };
       }
       const repoUrl = makeHttpUrl(`https://github.com/${rawSource.repo.trim()}.git`);
       if (typeof rawSource.path === "string" && rawSource.path.trim().length > 0) {
         const parsedPath = parseRelativeSubpath(rawSource.path);
         if (!parsedPath.ok) {
-          return { ok: false, skip: false, reason: parsedPath.error.message };
+          return { ok: false, kind: "invalid", reason: parsedPath.error.message };
         }
         return {
           ok: true,
@@ -1417,33 +1512,61 @@ async function resolveMarketplacePluginSource(input: {
     case "directory":
     case "local": {
       if (typeof rawSource.path !== "string") {
-        return { ok: false, skip: false, reason: "Local directory source requires 'path'." };
+        return { ok: false, kind: "invalid", reason: "Local directory source requires 'path'." };
       }
       const trimmedPath = rawSource.path.trim();
-      if (path.isAbsolute(trimmedPath)) {
-        const abs = parseAbsolutePath(trimmedPath);
-        if (!abs.ok) {
-          return { ok: false, skip: false, reason: abs.error.message };
-        }
-        return { ok: true, source: { kind: "local-dir", path: abs.value } };
+      if (trimmedPath.length === 0) {
+        return { ok: false, kind: "invalid", reason: "Local directory source path cannot be empty." };
+      }
+      if (
+        path.isAbsolute(trimmedPath) ||
+        trimmedPath.startsWith("/") ||
+        trimmedPath.startsWith("\\") ||
+        WINDOWS_DRIVE_RE.test(trimmedPath)
+      ) {
+        return {
+          ok: false,
+          kind: "path-traversal",
+          offendingPath: trimmedPath,
+          resolvedOutsideRoot: trimmedPath,
+          reason: `Absolute path "${trimmedPath}" is not allowed in marketplace manifests.`,
+        };
+      }
+      if (isCurrentDirPath(trimmedPath)) {
+        return { ok: true, source: { kind: "marketplace-root", marketplaceId } };
       }
       const rel = parseRelativeSubpath(trimmedPath);
       if (!rel.ok) {
-        return { ok: false, skip: false, reason: rel.error.message };
+        if (rel.error.code === "path-traversal") {
+          return {
+            ok: false,
+            kind: "path-traversal",
+            offendingPath: trimmedPath,
+            resolvedOutsideRoot: trimmedPath,
+            reason: rel.error.message,
+          };
+        }
+        return { ok: false, kind: "invalid", reason: rel.error.message };
       }
+      const finalSubpath = await resolveRelativeSubdirWithPrefix({
+        subpath: rel.value,
+        pluginRootPrefix,
+        rootDir,
+        canonicalRootDir,
+      });
       return {
         ok: true,
         source: {
           kind: "marketplace-subdir",
           marketplaceId,
-          subdir: rel.value,
+          subdir: finalSubpath,
         },
       };
     }
     case "command":
-      return { ok: false, skip: true };
+      return { ok: false, kind: "skip" };
     default:
-      return { ok: false, skip: false, reason: `Unsupported plugin source kind "${rawSource.source}".` };
+      return { ok: false, kind: "invalid", reason: `Unsupported plugin source kind "${rawSource.source}".` };
   }
 }
 
@@ -1588,22 +1711,45 @@ export async function normalizeJsonCatalog(
       marketplaceId,
       pluginRootPrefix,
       rootDir,
+      canonicalRootDir,
     });
     if (!resolvedSource.ok) {
-      if (!resolvedSource.skip) {
-        diagnostics.push({
-          id: makeDiagnosticId("marketplace-manifest-invalid", marketplaceId, rawName),
-          severity: "warning",
-          subject: { kind: "marketplace", marketplaceId },
-          detail: {
-            kind: "marketplace-manifest-invalid",
-            marketplaceId,
-            filePath,
-            reason: `Plugin "${rawName}": ${resolvedSource.reason}`,
-          },
-          message: `Skipped plugin "${rawName}" in marketplace "${marketplaceId}": ${resolvedSource.reason}`,
-          hint: "Ensure plugin source paths are valid relative subpaths without '..' or valid remote URLs.",
-        });
+      switch (resolvedSource.kind) {
+        case "skip":
+          break;
+        case "path-traversal":
+          diagnostics.push({
+            id: makeDiagnosticId("path-traversal-rejected", marketplaceId, rawName),
+            severity: "error",
+            subject: { kind: "marketplace", marketplaceId },
+            detail: {
+              kind: "path-traversal-rejected",
+              offendingPath: resolvedSource.offendingPath,
+              resolvedOutsideRoot: resolvedSource.resolvedOutsideRoot,
+            },
+            message: `Rejected plugin "${rawName}" in marketplace "${marketplaceId}": ${resolvedSource.reason}`,
+            hint: "Plugin sources inside marketplace manifests must be relative paths contained inside the marketplace root or valid remote URLs.",
+          });
+          break;
+        case "invalid":
+          diagnostics.push({
+            id: makeDiagnosticId("marketplace-manifest-invalid", marketplaceId, rawName),
+            severity: "warning",
+            subject: { kind: "marketplace", marketplaceId },
+            detail: {
+              kind: "marketplace-manifest-invalid",
+              marketplaceId,
+              filePath,
+              reason: `Plugin "${rawName}": ${resolvedSource.reason}`,
+            },
+            message: `Skipped plugin "${rawName}" in marketplace "${marketplaceId}": ${resolvedSource.reason}`,
+            hint: "Ensure plugin source paths are valid relative subpaths without '..' or valid remote URLs.",
+          });
+          break;
+        default: {
+          const _exhaustive: never = resolvedSource;
+          return _exhaustive;
+        }
       }
       continue;
     }
@@ -1647,45 +1793,90 @@ export async function normalizeJsonCatalog(
     if (
       rootDir !== undefined &&
       canonicalRootDir !== null &&
-      resolvedSource.source.kind === "marketplace-subdir"
+      (resolvedSource.source.kind === "marketplace-subdir" ||
+        resolvedSource.source.kind === "marketplace-root")
     ) {
-      const localPluginDir = joinAbsolutePath(rootDir, resolvedSource.source.subdir);
-      if (await isInsideCanonicalRoot(localPluginDir, canonicalRootDir)) {
+      const localPluginDir =
+        resolvedSource.source.kind === "marketplace-root"
+          ? rootDir
+          : joinAbsolutePath(rootDir, resolvedSource.source.subdir);
+      const dirOffendingLabel =
+        resolvedSource.source.kind === "marketplace-root" ? "." : resolvedSource.source.subdir;
+      const dirCheck = await checkContainedPath(localPluginDir, canonicalRootDir);
+      if (dirCheck.kind === "escaped") {
+        diagnostics.push({
+          id: makeDiagnosticId("path-traversal-rejected", marketplaceId, rawName),
+          severity: "error",
+          subject: { kind: "marketplace", marketplaceId },
+          detail: {
+            kind: "path-traversal-rejected",
+            offendingPath: dirOffendingLabel,
+            resolvedOutsideRoot: dirCheck.resolvedOutsideRoot,
+          },
+          message: `Rejected plugin "${rawName}" in marketplace "${marketplaceId}": "${dirOffendingLabel}" resolves outside marketplace root (${dirCheck.resolvedOutsideRoot}).`,
+          hint: "Remove the escaping symlink from the marketplace repository.",
+        });
+        continue;
+      }
+      if (dirCheck.kind === "contained") {
+        const canonicalPluginDir = dirCheck.realPath;
         const pluginManifest = await findPluginManifestFile(localPluginDir);
         if (pluginManifest !== null) {
-          try {
-            const manifestBytes = await fs.readFile(pluginManifest.path);
-            const manifestParsed = parseJsoncBomSafe(manifestBytes, pluginManifest.path);
-            if (manifestParsed.ok) {
-              const norm = normalizeAntigravityManifest(manifestParsed.value, slug);
-              if (norm.ok) {
-                if (version === null && norm.manifest.version !== undefined) {
-                  version = norm.manifest.version;
-                }
-                if (description.length === 0 && norm.manifest.description !== undefined) {
-                  description = norm.manifest.description;
-                }
-                if (displayName === rawName && norm.manifest.displayName !== undefined) {
-                  displayName = norm.manifest.displayName;
-                }
-                if (author === null && norm.manifest.author !== undefined) {
-                  author = norm.manifest.author;
-                }
-                if (homepage === null && norm.manifest.homepage !== undefined) {
-                  homepage = norm.manifest.homepage;
-                }
-                if (repository === null && norm.manifest.repository !== undefined) {
-                  repository = norm.manifest.repository;
-                }
-                if (category === null && norm.extras.category !== null) {
-                  category = norm.extras.category;
-                }
-                for (const tag of norm.extras.tags) {
-                  tagSet.add(tag);
+          const manifestCheck = await checkContainedPath(pluginManifest.path, canonicalPluginDir);
+          if (manifestCheck.kind === "escaped") {
+            const manifestOffending =
+              resolvedSource.source.kind === "marketplace-root"
+                ? pluginManifest.relativePath
+                : `${resolvedSource.source.subdir}/${pluginManifest.relativePath}`;
+            diagnostics.push({
+              id: makeDiagnosticId("path-traversal-rejected", marketplaceId, rawName),
+              severity: "error",
+              subject: { kind: "marketplace", marketplaceId },
+              detail: {
+                kind: "path-traversal-rejected",
+                offendingPath: manifestOffending,
+                resolvedOutsideRoot: manifestCheck.resolvedOutsideRoot,
+              },
+              message: `Rejected plugin "${rawName}" in marketplace "${marketplaceId}": manifest "${manifestOffending}" resolves outside plugin root (${manifestCheck.resolvedOutsideRoot}).`,
+              hint: "Remove the escaping symlink from the plugin manifest.",
+            });
+            continue;
+          }
+          if (manifestCheck.kind === "contained") {
+            try {
+              const manifestBytes = await fs.readFile(pluginManifest.path);
+              const manifestParsed = parseJsoncBomSafe(manifestBytes, pluginManifest.path);
+              if (manifestParsed.ok) {
+                const norm = normalizeAntigravityManifest(manifestParsed.value, slug);
+                if (norm.ok) {
+                  if (version === null && norm.manifest.version !== undefined) {
+                    version = norm.manifest.version;
+                  }
+                  if (description.length === 0 && norm.manifest.description !== undefined) {
+                    description = norm.manifest.description;
+                  }
+                  if (displayName === rawName && norm.manifest.displayName !== undefined) {
+                    displayName = norm.manifest.displayName;
+                  }
+                  if (author === null && norm.manifest.author !== undefined) {
+                    author = norm.manifest.author;
+                  }
+                  if (homepage === null && norm.manifest.homepage !== undefined) {
+                    homepage = norm.manifest.homepage;
+                  }
+                  if (repository === null && norm.manifest.repository !== undefined) {
+                    repository = norm.manifest.repository;
+                  }
+                  if (category === null && norm.extras.category !== null) {
+                    category = norm.extras.category;
+                  }
+                  for (const tag of norm.extras.tags) {
+                    tagSet.add(tag);
+                  }
                 }
               }
+            } catch {
             }
-          } catch {
           }
         }
         const preview = await previewPluginComponents(localPluginDir);
@@ -1748,6 +1939,32 @@ const EXTERNAL_MARKETPLACE_CANDIDATES: readonly {
   { relativePath: ".cursor-plugin/marketplace.json", ecosystem: "cursor" },
 ];
 
+function buildMarketplacePathTraversalResult(
+  marketplaceId: MarketplaceId,
+  offendingPath: string,
+  resolvedOutsideRoot: string,
+): CatalogNormalizationResult {
+  return {
+    ok: false,
+    format: null,
+    entries: [],
+    diagnostics: [
+      {
+        id: makeDiagnosticId("path-traversal-rejected", marketplaceId, offendingPath),
+        severity: "error",
+        subject: { kind: "marketplace", marketplaceId },
+        detail: {
+          kind: "path-traversal-rejected",
+          offendingPath,
+          resolvedOutsideRoot,
+        },
+        message: `Marketplace "${marketplaceId}" manifest "${offendingPath}" resolves outside marketplace root (${resolvedOutsideRoot}).`,
+        hint: "Remove the escaping symlink from the marketplace repository.",
+      },
+    ],
+  };
+}
+
 /**
  * Probes a local directory or cloned git mirror for an Antigravity, Claude, or Cursor
  * marketplace manifest, falling back to single-plugin mode when only a `plugin.json` exists.
@@ -1756,8 +1973,46 @@ export async function normalizeMarketplaceRoot(
   marketplaceId: MarketplaceId,
   rootDir: AbsolutePath,
 ): Promise<CatalogNormalizationResult> {
+  let canonicalRootDir: string;
+  try {
+    canonicalRootDir = await fs.realpath(rootDir);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      format: null,
+      entries: [],
+      diagnostics: [
+        {
+          id: makeDiagnosticId("marketplace-manifest-invalid", marketplaceId),
+          severity: "error",
+          subject: { kind: "marketplace", marketplaceId },
+          detail: {
+            kind: "marketplace-manifest-invalid",
+            marketplaceId,
+            filePath: rootDir,
+            reason,
+          },
+          message: `Failed to access marketplace directory "${rootDir}": ${reason}`,
+          hint: "Ensure the marketplace directory exists and is readable.",
+        },
+      ],
+    };
+  }
+
   for (const candidate of NATIVE_MARKETPLACE_CANDIDATES) {
     const candidatePath = joinAbsolutePath(rootDir, makeRelativeSubpath(candidate.relativePath));
+    const check = await checkContainedPath(candidatePath, canonicalRootDir);
+    if (check.kind === "missing") {
+      continue;
+    }
+    if (check.kind === "escaped") {
+      return buildMarketplacePathTraversalResult(
+        marketplaceId,
+        candidate.relativePath,
+        check.resolvedOutsideRoot,
+      );
+    }
     let rawBytes: Uint8Array;
     try {
       rawBytes = await fs.readFile(candidatePath);
@@ -1774,6 +2029,17 @@ export async function normalizeMarketplaceRoot(
   let bestExternal: CatalogNormalizationResult | null = null;
   for (const candidate of EXTERNAL_MARKETPLACE_CANDIDATES) {
     const candidatePath = joinAbsolutePath(rootDir, makeRelativeSubpath(candidate.relativePath));
+    const check = await checkContainedPath(candidatePath, canonicalRootDir);
+    if (check.kind === "missing") {
+      continue;
+    }
+    if (check.kind === "escaped") {
+      return buildMarketplacePathTraversalResult(
+        marketplaceId,
+        candidate.relativePath,
+        check.resolvedOutsideRoot,
+      );
+    }
     let rawBytes: Uint8Array;
     try {
       rawBytes = await fs.readFile(candidatePath);
@@ -1796,111 +2062,121 @@ export async function normalizeMarketplaceRoot(
 
   const singleManifest = await findPluginManifestFile(rootDir);
   if (singleManifest !== null) {
-    let rawBytes: Uint8Array;
-    try {
-      rawBytes = await fs.readFile(singleManifest.path);
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
-      return {
-        ok: false,
-        format: null,
-        entries: [],
-        diagnostics: [
-          {
-            id: makeDiagnosticId("marketplace-manifest-invalid", marketplaceId),
-            severity: "error",
-            subject: { kind: "marketplace", marketplaceId },
-            detail: {
-              kind: "marketplace-manifest-invalid",
-              marketplaceId,
-              filePath: singleManifest.path,
-              reason,
+    const manifestCheck = await checkContainedPath(singleManifest.path, canonicalRootDir);
+    if (manifestCheck.kind === "escaped") {
+      return buildMarketplacePathTraversalResult(
+        marketplaceId,
+        singleManifest.relativePath,
+        manifestCheck.resolvedOutsideRoot,
+      );
+    }
+    if (manifestCheck.kind === "contained") {
+      let rawBytes: Uint8Array;
+      try {
+        rawBytes = await fs.readFile(singleManifest.path);
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        return {
+          ok: false,
+          format: null,
+          entries: [],
+          diagnostics: [
+            {
+              id: makeDiagnosticId("marketplace-manifest-invalid", marketplaceId),
+              severity: "error",
+              subject: { kind: "marketplace", marketplaceId },
+              detail: {
+                kind: "marketplace-manifest-invalid",
+                marketplaceId,
+                filePath: singleManifest.path,
+                reason,
+              },
+              message: `Failed to read plugin manifest for "${marketplaceId}": ${reason}`,
+              hint: "Ensure the plugin manifest file is readable.",
             },
-            message: `Failed to read plugin manifest for "${marketplaceId}": ${reason}`,
-            hint: "Ensure the plugin manifest file is readable.",
-          },
-        ],
+          ],
+        };
+      }
+
+      const parsed = parseJsoncBomSafe(rawBytes, singleManifest.path);
+      if (!parsed.ok) {
+        return {
+          ok: false,
+          format: null,
+          entries: [],
+          diagnostics: [
+            {
+              id: makeDiagnosticId("marketplace-json-syntax", marketplaceId),
+              severity: "error",
+              subject: { kind: "marketplace", marketplaceId },
+              detail: {
+                kind: "manifest-json-syntax",
+                filePath: singleManifest.path,
+                line: parsed.line,
+                column: parsed.column,
+                hadUtf8Bom: parsed.hadUtf8Bom,
+                syntaxError: parsed.syntaxError,
+              },
+              message: `Failed to parse plugin.json for single-plugin marketplace "${marketplaceId}": ${parsed.syntaxError}`,
+              hint: "Fix the JSON syntax error in plugin.json.",
+            },
+          ],
+        };
+      }
+
+      const fallbackName = path.basename(rootDir);
+      const normalized = normalizeAntigravityManifest(parsed.value, fallbackName);
+      if (!normalized.ok) {
+        return {
+          ok: false,
+          format: null,
+          entries: [],
+          diagnostics: [
+            {
+              id: makeDiagnosticId("marketplace-manifest-invalid", marketplaceId),
+              severity: "error",
+              subject: { kind: "marketplace", marketplaceId },
+              detail: {
+                kind: "marketplace-manifest-invalid",
+                marketplaceId,
+                filePath: singleManifest.path,
+                reason: normalized.fieldErrors.join(" "),
+              },
+              message: `Invalid plugin.json for "${marketplaceId}": ${normalized.fieldErrors.join(" ")}`,
+              hint: "Fix the manifest schema errors in plugin.json.",
+            },
+          ],
+        };
+      }
+
+      const slug = slugifyPluginDirName(normalized.manifest.name, fallbackName);
+      const preview = await previewPluginComponents(rootDir);
+      const entry: CatalogEntry = {
+        id: makeCatalogEntryId(marketplaceId, slug),
+        marketplaceId,
+        slug,
+        name: normalized.manifest.name,
+        displayName: normalized.manifest.displayName ?? normalized.manifest.name,
+        description: normalized.manifest.description ?? "",
+        version: normalized.manifest.version ?? null,
+        author: normalized.manifest.author ?? null,
+        category: normalized.extras.category,
+        tags: normalized.extras.tags,
+        homepage: normalized.manifest.homepage ?? null,
+        repository: normalized.manifest.repository ?? null,
+        sourceFormat: "single-plugin",
+        installSource: { kind: "marketplace-root", marketplaceId },
+        componentCounts: preview?.counts ?? EMPTY_COMPONENT_COUNTS,
+        componentsPreview: preview?.inventory ?? EMPTY_COMPONENT_INVENTORY,
+      };
+
+      return {
+        ok: true,
+        format: "single-plugin",
+        entries: [entry],
+        diagnostics: [],
       };
     }
-
-    const parsed = parseJsoncBomSafe(rawBytes, singleManifest.path);
-    if (!parsed.ok) {
-      return {
-        ok: false,
-        format: null,
-        entries: [],
-        diagnostics: [
-          {
-            id: makeDiagnosticId("marketplace-json-syntax", marketplaceId),
-            severity: "error",
-            subject: { kind: "marketplace", marketplaceId },
-            detail: {
-              kind: "manifest-json-syntax",
-              filePath: singleManifest.path,
-              line: parsed.line,
-              column: parsed.column,
-              hadUtf8Bom: parsed.hadUtf8Bom,
-              syntaxError: parsed.syntaxError,
-            },
-            message: `Failed to parse plugin.json for single-plugin marketplace "${marketplaceId}": ${parsed.syntaxError}`,
-            hint: "Fix the JSON syntax error in plugin.json.",
-          },
-        ],
-      };
-    }
-
-    const fallbackName = path.basename(rootDir);
-    const normalized = normalizeAntigravityManifest(parsed.value, fallbackName);
-    if (!normalized.ok) {
-      return {
-        ok: false,
-        format: null,
-        entries: [],
-        diagnostics: [
-          {
-            id: makeDiagnosticId("marketplace-manifest-invalid", marketplaceId),
-            severity: "error",
-            subject: { kind: "marketplace", marketplaceId },
-            detail: {
-              kind: "marketplace-manifest-invalid",
-              marketplaceId,
-              filePath: singleManifest.path,
-              reason: normalized.fieldErrors.join(" "),
-            },
-            message: `Invalid plugin.json for "${marketplaceId}": ${normalized.fieldErrors.join(" ")}`,
-            hint: "Fix the manifest schema errors in plugin.json.",
-          },
-        ],
-      };
-    }
-
-    const slug = slugifyPluginDirName(normalized.manifest.name, fallbackName);
-    const preview = await previewPluginComponents(rootDir);
-    const entry: CatalogEntry = {
-      id: makeCatalogEntryId(marketplaceId, slug),
-      marketplaceId,
-      slug,
-      name: normalized.manifest.name,
-      displayName: normalized.manifest.displayName ?? normalized.manifest.name,
-      description: normalized.manifest.description ?? "",
-      version: normalized.manifest.version ?? null,
-      author: normalized.manifest.author ?? null,
-      category: normalized.extras.category,
-      tags: normalized.extras.tags,
-      homepage: normalized.manifest.homepage ?? null,
-      repository: normalized.manifest.repository ?? null,
-      sourceFormat: "single-plugin",
-      installSource: { kind: "local-dir", path: rootDir },
-      componentCounts: preview?.counts ?? EMPTY_COMPONENT_COUNTS,
-      componentsPreview: preview?.inventory ?? EMPTY_COMPONENT_INVENTORY,
-    };
-
-    return {
-      ok: true,
-      format: "single-plugin",
-      entries: [entry],
-      diagnostics: [],
-    };
   }
 
   return {

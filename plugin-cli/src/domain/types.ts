@@ -88,7 +88,7 @@ const PLUGIN_DIR_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 const ISO_TIMESTAMP_RE =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|([+-])(\d{2}):(\d{2}))$/;
 const SCP_SSH_GIT_RE =
-  /^[a-zA-Z0-9._-]+@([a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*):([^\s]+)$/;
+  /^[a-zA-Z0-9._-]+@([a-zA-Z0-9_](?:[a-zA-Z0-9_-]*[a-zA-Z0-9_])?(?:\.[a-zA-Z0-9_](?:[a-zA-Z0-9_-]*[a-zA-Z0-9_])?)*):([^\s]+)$/;
 
 function hasDotDotSegment(rawPath: string): boolean {
   for (const segment of rawPath.split("/")) {
@@ -686,6 +686,10 @@ export type ParsedMarketplaceInput =
  * Concrete source from which an individual plugin bundle can be materialized.
  */
 export type PluginInstallSource =
+  | {
+      readonly kind: "marketplace-root";
+      readonly marketplaceId: MarketplaceId;
+    }
   | {
       readonly kind: "marketplace-subdir";
       readonly marketplaceId: MarketplaceId;

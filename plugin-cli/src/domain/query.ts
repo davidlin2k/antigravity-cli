@@ -84,8 +84,10 @@ function isValidGitRef(ref: string): boolean {
     !CONTROL_CHAR_RE.test(ref) &&
     !WHITESPACE_RE.test(ref) &&
     !ref.includes("..") &&
+    !ref.includes("//") &&
     !ref.startsWith("/") &&
-    !ref.endsWith("/")
+    !ref.endsWith("/") &&
+    !ref.split("/").some((segment) => segment === ".")
   );
 }
 
@@ -265,15 +267,15 @@ function parseHttpMarketplace(
     return parseErr("invalid-url", originalInput, `Invalid HTTP(S) URL: "${originalInput}".`);
   }
 
-  const lowerPath = parsed.pathname.toLowerCase();
-  if (lowerPath.endsWith(".git")) {
+  const normalizedLowerPath = parsed.pathname.replace(/\/+$/, "").toLowerCase();
+  if (normalizedLowerPath.endsWith(".git")) {
     return parseOk(
       hashRef !== undefined
         ? { kind: "https-git", url: cleanRaw, ref: hashRef }
         : { kind: "https-git", url: cleanRaw },
     );
   }
-  if (lowerPath.endsWith(".json")) {
+  if (normalizedLowerPath.endsWith(".json")) {
     return parseOk({ kind: "https-json", url: cleanRaw });
   }
   return parseOk(
@@ -351,24 +353,24 @@ export function parseMarketplaceInput(input: {
   if (
     slashIdx > 0 &&
     slashIdx < trimmed.length - 1 &&
-    trimmed.indexOf("/", slashIdx + 1) === -1 &&
     !trimmed.includes("\\") &&
     !WHITESPACE_RE.test(trimmed)
   ) {
     const owner = trimmed.slice(0, slashIdx);
     const repoWithRef = trimmed.slice(slashIdx + 1);
-    if (!repoWithRef.toLowerCase().endsWith(".json")) {
-      const atIdx = repoWithRef.indexOf("@");
-      const hashIdx = repoWithRef.indexOf("#");
-      const refSplitIdx =
-        atIdx !== -1 && hashIdx !== -1
-          ? Math.min(atIdx, hashIdx)
-          : atIdx !== -1
-            ? atIdx
-            : hashIdx;
+    const atIdx = repoWithRef.indexOf("@");
+    const hashIdx = repoWithRef.indexOf("#");
+    const refSplitIdx =
+      atIdx !== -1 && hashIdx !== -1
+        ? Math.min(atIdx, hashIdx)
+        : atIdx !== -1
+          ? atIdx
+          : hashIdx;
 
-      const repoRaw = refSplitIdx === -1 ? repoWithRef : repoWithRef.slice(0, refSplitIdx);
-      const ref = refSplitIdx === -1 ? undefined : repoWithRef.slice(refSplitIdx + 1);
+    const repoRaw = refSplitIdx === -1 ? repoWithRef : repoWithRef.slice(0, refSplitIdx);
+    const ref = refSplitIdx === -1 ? undefined : repoWithRef.slice(refSplitIdx + 1);
+
+    if (!repoRaw.includes("/") && !repoRaw.toLowerCase().endsWith(".json")) {
       const repo = stripGitSuffix(repoRaw);
 
       if (GITHUB_OWNER_RE.test(owner) && GITHUB_REPO_RE.test(repo)) {
@@ -575,21 +577,32 @@ export function parseInstallTarget(input: {
         `Invalid install target "${input.raw}". Prefix local paths with "./".`,
       );
     }
-    const parts = trimmed.split("/");
-    if (parts.length !== 2) {
+    const firstSlash = trimmed.indexOf("/");
+    const left = trimmed.slice(0, firstSlash);
+    const right = trimmed.slice(firstSlash + 1);
+    if (left.length === 0 || right.length === 0) {
+      return parseErr("invalid-source", input.raw, `Invalid install target: "${input.raw}".`);
+    }
+
+    const atIdx = right.indexOf("@");
+    const hashIdx = right.indexOf("#");
+    const refSplitIdx =
+      atIdx !== -1 && hashIdx !== -1
+        ? Math.min(atIdx, hashIdx)
+        : atIdx !== -1
+          ? atIdx
+          : hashIdx;
+    const rightBeforeRef = refSplitIdx === -1 ? right : right.slice(0, refSplitIdx);
+
+    if (rightBeforeRef.includes("/")) {
       return parseErr(
         "invalid-source",
         input.raw,
         `Ambiguous multi-segment path "${input.raw}". Prefix local paths with "./".`,
       );
     }
-    const left = parts[0] ?? "";
-    const right = parts[1] ?? "";
-    if (left.length === 0 || right.length === 0) {
-      return parseErr("invalid-source", input.raw, `Invalid install target: "${input.raw}".`);
-    }
 
-    if (right.includes("@") || right.includes("#") || right.endsWith(".git")) {
+    if (refSplitIdx !== -1 || right.endsWith(".git")) {
       const parsedSource = parseMarketplaceInput({
         raw: trimmed,
         cwd: input.cwd,

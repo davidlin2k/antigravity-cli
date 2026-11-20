@@ -85,6 +85,7 @@ import {
   deleteSyncCache,
   deriveWorkspacePaths,
   errorMessage,
+  isWithinCanonicalRoot,
   loadAllReceipts,
   loadAllSyncCaches,
   loadKnownMarketplaces,
@@ -107,6 +108,8 @@ function installSourcesEqual(a: PluginInstallSource, b: PluginInstallSource): bo
     return false;
   }
   switch (a.kind) {
+    case "marketplace-root":
+      return b.kind === "marketplace-root" && a.marketplaceId === b.marketplaceId;
     case "marketplace-subdir":
       return (
         b.kind === "marketplace-subdir" &&
@@ -191,7 +194,7 @@ function defaultDirNameFromSource(source: MarketplaceSource): PluginDirName {
       if (source.subdir !== undefined) {
         return slugifyPluginDirName(path.basename(source.subdir));
       }
-      const clean = source.url.replace(/\.git$/i, "");
+      const clean = source.url.replace(/\/+$/, "").replace(/\.git$/i, "");
       const last = clean.split(/[/:]/).filter((s) => s.length > 0).at(-1) ?? "plugin";
       return slugifyPluginDirName(last);
     }
@@ -263,6 +266,32 @@ function resolveInstalledSelector(
     };
   }
   return { ok: false, error: { kind: "plugin-not-found", selector: selectorLabel(selector) } };
+}
+
+async function isInstalledPluginCurrentlyDisabled(
+  installPath: AbsolutePath,
+  fallback: boolean,
+): Promise<boolean> {
+  try {
+    const canonicalRoot = await fs.realpath(installPath);
+    const found = await findPluginManifestFile(installPath);
+    if (found === null) {
+      return fallback;
+    }
+    const realManifest = await fs.realpath(found.path);
+    if (!isWithinCanonicalRoot(realManifest, canonicalRoot)) {
+      return fallback;
+    }
+    const bytes = await fs.readFile(found.path);
+    const parsed = parseJsoncBomSafe(bytes, found.path);
+    if (!parsed.ok) {
+      return fallback;
+    }
+    const norm = normalizeAntigravityManifest(parsed.value);
+    return norm.ok ? norm.manifest.disabled === true : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 async function peekCandidatePluginName(
@@ -405,6 +434,7 @@ export function createPluginEngine(config: PluginEngineConfig): PluginEngine {
       let marketplaceId: MarketplaceId | undefined;
       let entryId: CatalogEntryId | undefined;
       let fallbackName: string | undefined;
+      let catalogVersion: string | null = null;
 
       const { target } = input;
       switch (target.kind) {
@@ -419,6 +449,7 @@ export function createPluginEngine(config: PluginEngineConfig): PluginEngine {
           marketplaceId = entry.marketplaceId;
           entryId = entry.id;
           fallbackName = entry.name;
+          catalogVersion = entry.version;
           break;
         }
         case "catalog-name": {
@@ -466,6 +497,7 @@ export function createPluginEngine(config: PluginEngineConfig): PluginEngine {
           marketplaceId = matched.marketplaceId;
           entryId = matched.id;
           fallbackName = matched.name;
+          catalogVersion = matched.version;
           break;
         }
         case "catalog-or-github": {
@@ -477,6 +509,7 @@ export function createPluginEngine(config: PluginEngineConfig): PluginEngine {
             marketplaceId = catalogEntry.marketplaceId;
             entryId = catalogEntry.id;
             fallbackName = catalogEntry.name;
+            catalogVersion = catalogEntry.version;
           } else {
             const directSrc = marketplaceSourceToPluginInstallSource(target.githubSource);
             if (directSrc === null) {
@@ -596,19 +629,21 @@ export function createPluginEngine(config: PluginEngineConfig): PluginEngine {
         }
 
         const adapted = await withTargetLock(targetLockPath(scopeRoot, dirName), async () => {
-          await recoverAndCleanStagingArtifacts(scopeRoot, input.scope);
+          await recoverAndCleanStagingArtifacts(scopeRoot, input.scope, dirName);
           const result = await adaptAndInstallBundle({
             sourceDir: bundle.sourceDir,
             scopeRoot,
             scope: input.scope,
             dirName,
             fallbackName: fallbackName ?? dirName,
+            ...(catalogVersion !== null ? { fallbackVersion: catalogVersion } : {}),
           });
           if (!result.ok) {
             return result;
           }
 
           const installedAt = makeIsoTimestamp();
+          const installedVersion = result.manifest.version ?? catalogVersion ?? null;
           const provenance: ManagedProvenance =
             provenanceKind === "marketplace" &&
             marketplaceId !== undefined &&
@@ -618,14 +653,14 @@ export function createPluginEngine(config: PluginEngineConfig): PluginEngine {
                   marketplaceId,
                   entryId,
                   installSource,
-                  installedVersion: result.manifest.version ?? null,
+                  installedVersion,
                   installedSha: bundle.resolvedSha,
                   installedAt,
                 }
               : {
                   kind: "direct",
                   installSource,
-                  installedVersion: result.manifest.version ?? null,
+                  installedVersion,
                   installedSha: bundle.resolvedSha,
                   installedAt,
                 };
@@ -710,7 +745,7 @@ export function createPluginEngine(config: PluginEngineConfig): PluginEngine {
         const outcome: UninstallReport["outcome"] = await withTargetLock(
           targetLockPath(scopeRoot, dirName),
           async () => {
-            await recoverAndCleanStagingArtifacts(scopeRoot, scope);
+            await recoverAndCleanStagingArtifacts(scopeRoot, scope, dirName);
             const existsNow = await fs
               .lstat(installPath)
               .then(() => true)
@@ -752,20 +787,28 @@ export function createPluginEngine(config: PluginEngineConfig): PluginEngine {
         const toggled = await withTargetLock(
           targetLockPath(scopeRoot, plugin.dirName),
           async () => {
-            await recoverAndCleanStagingArtifacts(scopeRoot, plugin.scope);
+            await recoverAndCleanStagingArtifacts(scopeRoot, plugin.scope, plugin.dirName);
             return toggleManifestDisabledAtomic(plugin.installPath, plugin.id, input.enabled);
           },
         );
 
         if (!toggled.ok) {
-          if (toggled.kind === "bundle-invalid") {
-            return fail({ kind: "bundle-invalid", diagnostics: toggled.diagnostics });
+          switch (toggled.kind) {
+            case "path-traversal":
+              return fail({ kind: "path-traversal", offendingPath: toggled.offendingPath });
+            case "bundle-invalid":
+              return fail({ kind: "bundle-invalid", diagnostics: toggled.diagnostics });
+            case "io-failed":
+              return fail({
+                kind: "io-failed",
+                operation: toggled.operation,
+                reason: toggled.reason,
+              });
+            default: {
+              const _exhaustive: never = toggled;
+              return _exhaustive;
+            }
           }
-          return fail({
-            kind: "io-failed",
-            operation: toggled.operation,
-            reason: toggled.reason,
-          });
         }
 
         const after = await commitSnapshot();
@@ -896,13 +939,23 @@ export function createPluginEngine(config: PluginEngineConfig): PluginEngine {
           const adapted = await withTargetLock(
             targetLockPath(scopeRoot, plugin.dirName),
             async () => {
-              await recoverAndCleanStagingArtifacts(scopeRoot, plugin.scope);
+              await recoverAndCleanStagingArtifacts(scopeRoot, plugin.scope, plugin.dirName);
+              const preserveDisabled = await isInstalledPluginCurrentlyDisabled(
+                plugin.installPath,
+                plugin.kind === "valid" && plugin.manifest.disabled === true,
+              );
+              const fallbackVersion =
+                catalogEntry?.version !== undefined && catalogEntry.version !== null
+                  ? catalogEntry.version
+                  : undefined;
               const result = await adaptAndInstallBundle({
                 sourceDir: bundle.sourceDir,
                 scopeRoot,
                 scope: plugin.scope,
                 dirName: plugin.dirName,
                 fallbackName: plugin.dirName,
+                ...(fallbackVersion !== undefined ? { fallbackVersion } : {}),
+                ...(preserveDisabled ? { disabled: true } : {}),
               });
               if (!result.ok) {
                 return result;
@@ -1331,7 +1384,7 @@ export function createPluginEngine(config: PluginEngineConfig): PluginEngine {
             const result = await withTargetLock(
               targetLockPath(scopeRoot, dirName),
               async () => {
-                await recoverAndCleanStagingArtifacts(scopeRoot, scope);
+                await recoverAndCleanStagingArtifacts(scopeRoot, scope, dirName);
                 return readaptInstalledPlugin({ scopeRoot, scope, dirName });
               },
             );
@@ -1446,7 +1499,12 @@ export function createPluginEngine(config: PluginEngineConfig): PluginEngine {
                   reason: `Path "${plan.path}" is not inside a managed plugins root.`,
                 });
               }
-              const cleaned = await recoverAndCleanStagingArtifacts(parent, scope, plan.path);
+              const cleaned = await recoverAndCleanStagingArtifacts(
+                parent,
+                scope,
+                undefined,
+                plan.path,
+              );
               removedPaths.push(...cleaned);
             } else {
               const [userCleaned, projectCleaned] = await Promise.all([
