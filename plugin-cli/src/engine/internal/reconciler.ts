@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import {
   EMPTY_COMPONENT_COUNTS,
+  compareStrings,
   isAtLeastTwo,
   isNonEmpty,
   isPluginDirName,
@@ -59,13 +60,9 @@ interface ScannedValidCandidate {
   readonly diagnosticIds: DiagnosticId[];
 }
 
-function compareStrings(a: string, b: string): number {
-  return a < b ? -1 : a > b ? 1 : 0;
-}
-
 const SEMVER_RE = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/;
 
-export function isNewerVersion(candidate: string, current: string): boolean {
+function isNewerVersion(candidate: string, current: string): boolean {
   if (candidate === current) {
     return false;
   }

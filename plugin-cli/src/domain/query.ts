@@ -1,6 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  compareStrings,
   isAbsolutePath,
   isHttpUrl,
   isMarketplaceId,
@@ -690,10 +691,6 @@ interface NormalizedCatalogIndex {
 }
 
 const catalogIndexCache = new WeakMap<WorkspaceSnapshot, NormalizedCatalogIndex>();
-
-function compareStrings(a: string, b: string): number {
-  return a < b ? -1 : a > b ? 1 : 0;
-}
 
 function getCatalogIndex(snapshot: WorkspaceSnapshot): NormalizedCatalogIndex {
   const cached = catalogIndexCache.get(snapshot);

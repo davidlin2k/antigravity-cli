@@ -12,14 +12,12 @@ import {
   isIsoTimestamp,
   isManifestEcosystem,
   isMarketplaceId,
-  isNonEmpty,
   isPluginDirName,
   isPluginName,
   isRelativeSubpath,
   isSshGitUrl,
   joinAbsolutePath,
   makeAbsolutePath,
-  makeRelativeSubpath,
 } from "../../domain/types.ts";
 import type {
   AbsolutePath,
@@ -95,7 +93,7 @@ export interface PersistedReceipt {
   readonly provenance: ManagedProvenance;
 }
 
-export interface StaleStagingArtifact {
+interface StaleStagingArtifact {
   readonly path: AbsolutePath;
   readonly name: string;
   readonly scope: InstallScope;
@@ -150,7 +148,7 @@ export async function resolvePossiblyDanglingTarget(
   return resolveStep(canonicalStartDir, rawTarget, 0);
 }
 
-export type ContainedPathCheck =
+type ContainedPathCheck =
   | { readonly kind: "missing" }
   | { readonly kind: "contained"; readonly realPath: string }
   | { readonly kind: "escaped"; readonly resolvedOutsideRoot: string };
@@ -186,7 +184,7 @@ export async function checkContainedPath(
   }
 }
 
-export function getErrnoCode(error: unknown): string | undefined {
+function getErrnoCode(error: unknown): string | undefined {
   if (!isRecord(error)) {
     return undefined;
   }
@@ -215,27 +213,23 @@ export function scopeRootFor(paths: WorkspacePaths, scope: InstallScope): Absolu
   return scope === "user" ? paths.userPluginsDir : paths.projectPluginsDir;
 }
 
-export function knownMarketplacesPath(paths: WorkspacePaths): AbsolutePath {
+function knownMarketplacesPath(paths: WorkspacePaths): AbsolutePath {
   return makeAbsolutePath(path.join(paths.managerDir, "known_marketplaces.json"));
 }
 
-export function catalogCachePath(paths: WorkspacePaths): AbsolutePath {
+function catalogCachePath(paths: WorkspacePaths): AbsolutePath {
   return makeAbsolutePath(path.join(paths.managerDir, "catalog-cache.json"));
 }
 
-export function installedPluginsIndexPath(paths: WorkspacePaths): AbsolutePath {
+function installedPluginsIndexPath(paths: WorkspacePaths): AbsolutePath {
   return makeAbsolutePath(path.join(paths.managerDir, "installed_plugins.json"));
-}
-
-export function marketplacesMirrorRoot(paths: WorkspacePaths): AbsolutePath {
-  return makeAbsolutePath(path.join(paths.managerDir, "marketplaces"));
 }
 
 export function marketplaceMirrorPath(paths: WorkspacePaths, id: MarketplaceId): AbsolutePath {
   return makeAbsolutePath(path.join(paths.managerDir, "marketplaces", id));
 }
 
-export function syncCacheDir(paths: WorkspacePaths): AbsolutePath {
+function syncCacheDir(paths: WorkspacePaths): AbsolutePath {
   return makeAbsolutePath(path.join(paths.managerDir, "cache", "sync"));
 }
 
@@ -243,11 +237,11 @@ export function syncCachePath(paths: WorkspacePaths, id: MarketplaceId): Absolut
   return makeAbsolutePath(path.join(paths.managerDir, "cache", "sync", `${id}.json`));
 }
 
-export function receiptsDir(paths: WorkspacePaths): AbsolutePath {
+function receiptsDir(paths: WorkspacePaths): AbsolutePath {
   return makeAbsolutePath(path.join(paths.managerDir, "cache", "receipts"));
 }
 
-export function receiptPath(
+function receiptPath(
   paths: WorkspacePaths,
   scope: InstallScope,
   dirName: PluginDirName,
@@ -265,7 +259,7 @@ export function registryLockPath(paths: WorkspacePaths): AbsolutePath {
   return makeAbsolutePath(path.join(paths.managerDir, `${LOCK_PREFIX}marketplaces`));
 }
 
-export async function writeFileAtomic(
+async function writeFileAtomic(
   filePath: AbsolutePath,
   content: string | Uint8Array,
   mode = 0o644,
@@ -1175,15 +1169,6 @@ function decodeReceipt(raw: unknown): PersistedReceipt | null {
   };
 }
 
-export async function loadReceipt(
-  paths: WorkspacePaths,
-  scope: InstallScope,
-  dirName: PluginDirName,
-): Promise<PersistedReceipt | null> {
-  const raw = await readJsonSafe(receiptPath(paths, scope, dirName));
-  return decodeReceipt(raw);
-}
-
 export async function loadAllReceipts(
   paths: WorkspacePaths,
 ): Promise<Map<InstalledPluginId, PersistedReceipt>> {
@@ -1356,12 +1341,4 @@ export async function recoverAndCleanStagingArtifacts(
   }
 
   return removedPaths;
-}
-
-export function isNonEmptyList<T>(items: readonly T[]): items is readonly [T, ...T[]] {
-  return isNonEmpty(items);
-}
-
-export function safeJoinRelative(base: AbsolutePath, rawRelative: string): AbsolutePath {
-  return joinAbsolutePath(base, makeRelativeSubpath(rawRelative));
 }

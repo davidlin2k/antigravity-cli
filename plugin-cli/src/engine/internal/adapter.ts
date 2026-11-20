@@ -36,7 +36,7 @@ import {
   writeJsonAtomic,
 } from "./stores.ts";
 
-export interface AdaptInstallInput {
+interface AdaptInstallInput {
   readonly sourceDir: AbsolutePath;
   readonly scopeRoot: AbsolutePath;
   readonly scope: InstallScope;
@@ -46,7 +46,7 @@ export interface AdaptInstallInput {
   readonly disabled?: boolean;
 }
 
-export type AdaptInstallResult =
+type AdaptInstallResult =
   | {
       readonly ok: true;
       readonly installPath: AbsolutePath;
@@ -60,7 +60,7 @@ export type AdaptInstallResult =
   | { readonly ok: false; readonly kind: "bundle-invalid"; readonly diagnostics: NonEmpty<Diagnostic> }
   | { readonly ok: false; readonly kind: "io-failed"; readonly operation: string; readonly reason: string };
 
-export type ToggleManifestResult =
+type ToggleManifestResult =
   | { readonly ok: true; readonly outcome: "changed" | "unchanged" }
   | { readonly ok: false; readonly kind: "path-traversal"; readonly offendingPath: string }
   | { readonly ok: false; readonly kind: "bundle-invalid"; readonly diagnostics: NonEmpty<Diagnostic> }

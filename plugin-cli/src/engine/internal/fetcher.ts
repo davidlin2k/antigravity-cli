@@ -13,7 +13,6 @@ import {
 import type {
   AbsolutePath,
   Diagnostic,
-  ManifestEcosystem,
   MarketplaceId,
   MarketplaceSource,
   ParsedMarketplaceInput,
@@ -41,14 +40,14 @@ const execFileAsync = promisify(execFile);
 
 export const DEFAULT_NETWORK_TIMEOUT_MS = 30_000;
 
-export interface GitRunResult {
+interface GitRunResult {
   readonly ok: boolean;
   readonly stdout: string;
   readonly stderr: string;
   readonly message: string;
 }
 
-export async function runGit(
+async function runGit(
   args: readonly string[],
   options?: {
     readonly cwd?: AbsolutePath | string;
@@ -79,7 +78,7 @@ export async function runGit(
   }
 }
 
-export async function isBareGitRepo(dirPath: AbsolutePath): Promise<boolean> {
+async function isBareGitRepo(dirPath: AbsolutePath): Promise<boolean> {
   try {
     const headStat = await fs.stat(path.join(dirPath, "HEAD"));
     const objectsStat = await fs.stat(path.join(dirPath, "objects"));
@@ -697,13 +696,13 @@ export async function syncSingleMarketplace(
   }
 }
 
-export interface MaterializedBundle {
+interface MaterializedBundle {
   readonly sourceDir: AbsolutePath;
   readonly resolvedSha: string | null;
   readonly cleanup: () => Promise<void>;
 }
 
-export type MaterializeResult =
+type MaterializeResult =
   | { readonly ok: true; readonly bundle: MaterializedBundle }
   | { readonly ok: false; readonly kind: "path-traversal"; readonly offendingPath: string }
   | { readonly ok: false; readonly kind: "io-failed"; readonly operation: string; readonly reason: string };
@@ -1031,5 +1030,3 @@ export async function materializeInstallSource(input: {
     }
   }
 }
-
-export type { ManifestEcosystem };

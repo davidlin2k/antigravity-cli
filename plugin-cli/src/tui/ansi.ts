@@ -454,10 +454,6 @@ export function graphemeDisplayWidth(grapheme: string): number {
   return isWideCodePoint(firstVisibleCp) ? 2 : 1;
 }
 
-export function charDisplayWidth(ch: string): number {
-  return graphemeDisplayWidth(ch);
-}
-
 export function displayWidth(text: string): number {
   const plain = stripAnsi(text);
   let width = 0;

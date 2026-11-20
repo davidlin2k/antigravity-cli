@@ -1,7 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
-  EMPTY_COMPONENT_COUNTS,
   EMPTY_COMPONENT_INVENTORY,
   isNonEmpty,
   joinAbsolutePath,
@@ -44,7 +43,7 @@ import {
   resolvePossiblyDanglingTarget,
 } from "./stores.ts";
 
-export interface InspectPluginOptions {
+interface InspectPluginOptions {
   readonly pluginRoot: AbsolutePath;
   readonly subject: DiagnosticSubject;
   readonly pluginIdForRemediation?: InstalledPluginId;
@@ -105,7 +104,7 @@ function collectUnexpandedPluginRootVars(value: unknown, found: Set<string>): vo
   }
 }
 
-export function findUnexpandedPluginRootVarsInValue(value: unknown): NonEmpty<string> | null {
+function findUnexpandedPluginRootVarsInValue(value: unknown): NonEmpty<string> | null {
   const found = new Set<string>();
   collectUnexpandedPluginRootVars(value, found);
   const list = [...found];
@@ -937,5 +936,3 @@ export async function inspectPluginDirectory(
     diagnostics,
   };
 }
-
-export { EMPTY_COMPONENT_COUNTS };

@@ -11,6 +11,10 @@ export function isAtLeastTwo<T>(items: readonly T[]): items is AtLeastTwo<T> {
   return items.length >= 2;
 }
 
+export function compareStrings(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 export type ParseErrorCode =
   | "empty-input"
   | "invalid-path"

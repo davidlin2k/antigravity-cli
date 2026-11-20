@@ -3,7 +3,6 @@ import path from "node:path";
 import {
   EMPTY_COMPONENT_COUNTS,
   EMPTY_COMPONENT_INVENTORY,
-  isAbsolutePath,
   isHttpUrl,
   isNonEmpty,
   isPluginDirName,
@@ -44,7 +43,7 @@ import type {
 } from "../../domain/types.ts";
 import { checkContainedPath, isRecord, isWithinCanonicalRoot } from "./stores.ts";
 
-export type JsoncParseResult =
+type JsoncParseResult =
   | { readonly ok: true; readonly value: unknown; readonly hadUtf8Bom: boolean }
   | {
       readonly ok: false;
@@ -54,13 +53,13 @@ export type JsoncParseResult =
       readonly syntaxError: string;
     };
 
-export interface FoundManifestFile {
+interface FoundManifestFile {
   readonly path: AbsolutePath;
   readonly ecosystem: ManifestEcosystem;
   readonly relativePath: string;
 }
 
-export interface ManifestExtras {
+interface ManifestExtras {
   readonly category: string | null;
   readonly tags: readonly string[];
   readonly inlineMcpServers: Record<string, unknown> | null;
@@ -68,7 +67,7 @@ export interface ManifestExtras {
   readonly mcpPath: string | null;
 }
 
-export type ManifestNormalizeResult =
+type ManifestNormalizeResult =
   | {
       readonly ok: true;
       readonly manifest: NormalizedPluginManifest;
@@ -79,19 +78,19 @@ export type ManifestNormalizeResult =
       readonly fieldErrors: NonEmpty<string>;
     };
 
-export interface ParsedFrontmatter {
+interface ParsedFrontmatter {
   readonly present: boolean;
   readonly fields: ReadonlyMap<string, string>;
 }
 
-export interface ParsedHooksSummary {
+interface ParsedHooksSummary {
   readonly wrapped: boolean;
   readonly hooks: readonly HookSummary[];
   readonly totalCommands: number;
   readonly regexErrors: readonly string[];
 }
 
-export interface CatalogNormalizationResult {
+interface CatalogNormalizationResult {
   readonly ok: boolean;
   readonly format: ManifestEcosystem | null;
   readonly entries: readonly CatalogEntry[];
@@ -938,7 +937,7 @@ async function collectRuleFiles(
   }
 }
 
-export async function previewPluginComponents(
+async function previewPluginComponents(
   pluginDir: AbsolutePath,
 ): Promise<{ readonly counts: ComponentCounts; readonly inventory: ComponentInventory } | null> {
   let canonicalRoot: string;
@@ -2182,8 +2181,4 @@ export async function normalizeMarketplaceRoot(
       },
     ],
   };
-}
-
-export function isValidAbsolute(value: string): value is AbsolutePath {
-  return isAbsolutePath(value);
 }
