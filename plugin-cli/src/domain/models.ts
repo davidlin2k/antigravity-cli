@@ -57,10 +57,6 @@ export type MarketplaceSource =
 
 export type GithubMarketplaceSource = Extract<MarketplaceSource, { readonly kind: "github" }>;
 
-/**
- * Result of pure synchronous parsing of user-typed marketplace input.
- * Shared by CLI argument parsing and the TUI Add Marketplace live preview.
- */
 export type ParsedMarketplaceInput =
   | MarketplaceSource
   | {
@@ -476,10 +472,6 @@ export interface WorkspacePaths {
   readonly managerDir: AbsolutePath;
 }
 
-/**
- * Single immutable projection of the entire plugin workspace.
- * Every CLI command and every TUI frame renders exclusively from this value.
- */
 export interface WorkspaceSnapshot {
   readonly revision: SnapshotRevision;
   readonly projectedAt: IsoTimestamp;

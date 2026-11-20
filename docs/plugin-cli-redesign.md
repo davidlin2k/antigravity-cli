@@ -85,7 +85,7 @@ Both `agy-plugin marketplace add` and the TUI **Add Marketplace** modal call `pa
 
 ### Multi-format catalog normalization
 
-At sync time, `normalizer.ts` translates five external manifest ecosystems into `CatalogEntry` records identified by `CatalogEntryId` (`<marketplaceId>/<slug>`, for example `cursor-plugins/pstack`):
+At sync time, `jsonc.ts`, `manifest.ts`, `catalog-sources.ts`, and `catalog.ts` translate five external manifest ecosystems into `CatalogEntry` records identified by `CatalogEntryId` (`<marketplaceId>/<slug>`, for example `cursor-plugins/pstack`):
 
 1. **Antigravity native.** Probes `.antigravity-plugin/marketplace.json`, `.gemini-plugin/marketplace.json`, and root `marketplace.json`.
 2. **Claude Code marketplace.** Probes `.claude-plugin/marketplace.json` (verified against `claude-plugins-official` with 317 plugins). Normalizes relative paths (`"./plugins/..."` into `marketplace-subdir`), `{ source: "git-subdir", url, path, ref, sha }` objects, and `{ source: "url", url, sha }` objects, while indexing `renames` aliases.
