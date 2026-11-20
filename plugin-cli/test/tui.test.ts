@@ -52,21 +52,28 @@ import type {
   ValidationReport,
 } from "../src/engine/contract.ts";
 import {
+  EMPTY_TEXT_INPUT,
   SYNC_END,
   SYNC_START,
   TAB_IDS,
   TAB_REGISTRY,
   clampViewport,
+  computeFooterHints,
   createInitialTuiState,
   createKeyDecoder,
   diffFrames,
   displayWidth,
+  findInstalledForEntryInScope,
+  findSameNameCollisionInScope,
+  overlaySegmentOnLine,
   padVisible,
   parseKeyBytes,
   reduce,
+  reduceTextInput,
   renderFrame,
   resolveActiveSelectedIndex,
   runTui,
+  sanitizeInlineText,
   stripAnsi,
   truncateVisible,
 } from "../src/tui/index.ts";
@@ -708,7 +715,18 @@ describe("TUI reducer flows", () => {
     assert.equal(openEffects.length, 0);
     assert.equal(modal.overlay.kind, "discover-detail");
 
-    const { effects: uninstallEffects } = sendKeys(modal, [{ kind: "enter" }]);
+    const { state: confirmModal, effects: preConfirmEffects } = sendKeys(modal, [{ kind: "enter" }]);
+    assert.equal(preConfirmEffects.length, 0);
+    assert.equal(confirmModal.overlay.kind, "confirm");
+
+    const { state: backToDetail, effects: cancelEffects } = sendKeys(confirmModal, [{ kind: "enter" }]);
+    assert.equal(cancelEffects.length, 0);
+    assert.equal(backToDetail.overlay.kind, "discover-detail");
+
+    const { effects: uninstallEffects } = sendKeys(confirmModal, [
+      { kind: "tab" },
+      { kind: "enter" },
+    ]);
     assert.equal(uninstallEffects.length, 1);
     assert.equal(uninstallEffects[0]?.kind, "run-mutation");
     if (uninstallEffects[0]?.kind === "run-mutation") {
@@ -1026,5 +1044,550 @@ describe("TUI rendering, frame geometry, and diffFrames", () => {
     assert.equal(calls.length, 1);
     assert.equal(calls[0]?.kind, "install");
     assert.ok(fakeTerm.writes.some((w) => w.includes(SYNC_START)));
+  });
+});
+
+describe("TUI hardening regression suite", () => {
+  it("never lets modals overwrite header bar, validation toast, or bottom footer at 40x12..120x36", () => {
+    const snapshot = buildTestSnapshot({
+      catalog: [makeCatalogItem("cursor-plugins", "pstack")],
+      installed: [makeInstalledItem("user", "pstack")],
+    });
+    const base = createInitialTuiState(snapshot, { colorEnabled: false });
+    const addEmptySubmit = sendKeys(base, [{ kind: "char", ch: "a" }, { kind: "enter" }]).state;
+    assert.equal(addEmptySubmit.overlay.kind, "add-marketplace");
+    assert.equal(addEmptySubmit.toast?.tone, "error");
+
+    const helpModal = sendKeys(base, [{ kind: "char", ch: "?" }]).state;
+    const detailModal = sendKeys(base, [{ kind: "enter" }]).state;
+
+    for (const vp of [
+      { cols: 40, rows: 12 },
+      { cols: 60, rows: 18 },
+      { cols: 80, rows: 24 },
+      { cols: 120, rows: 36 },
+    ]) {
+      const fToast = renderFrame(addEmptySubmit, vp);
+      assert.equal(fToast.lines.length, vp.rows);
+      assert.match(fToast.lines[1] ?? "", /1 Disc/, `header preserved at ${vp.cols}x${vp.rows}`);
+      assert.match(
+        fToast.lines[vp.rows - 3] ?? "",
+        /Enter a GitHub repo/,
+        `toast preserved at ${vp.cols}x${vp.rows}`,
+      );
+      assert.match(fToast.lines[vp.rows - 2] ?? "", /Esc/, `footer preserved at ${vp.cols}x${vp.rows}`);
+      assert.match(fToast.lines.join("\n"), /Add Marketplace/, `modal visible at ${vp.cols}x${vp.rows}`);
+      assert.match(fToast.lines.join("\n"), /Cancel/, `modal buttons visible at ${vp.cols}x${vp.rows}`);
+
+      for (const modalState of [helpModal, detailModal]) {
+        const frame = renderFrame(modalState, vp);
+        assert.equal(frame.lines.length, vp.rows);
+        assert.match(frame.lines[1] ?? "", /1 Disc/);
+        assert.match(frame.lines[vp.rows - 2] ?? "", /Esc/);
+        for (const line of frame.lines) {
+          assert.ok(displayWidth(line) <= vp.cols);
+        }
+      }
+    }
+  });
+
+  it("renders unmistakable button focus and mid-string text cursor when NO_COLOR is active", () => {
+    const snapshot = buildTestSnapshot({
+      catalog: [makeCatalogItem("cursor-plugins", "pstack")],
+    });
+    const base = createInitialTuiState(snapshot, { colorEnabled: false });
+
+    const confirm1 = sendKeys(base, [{ kind: "enter" }]).state;
+    const confirm2 = sendKeys(confirm1, [{ kind: "tab" }]).state;
+    const fBtn1 = renderFrame(confirm1, { cols: 80, rows: 24 });
+    const fBtn2 = renderFrame(confirm2, { cols: 80, rows: 24 });
+    assert.notEqual(fBtn1.lines.join("\n"), fBtn2.lines.join("\n"));
+    assert.match(fBtn1.lines.join("\n"), /▸ \[ Install \]/);
+    assert.match(fBtn2.lines.join("\n"), /▸ \[ Switch Scope \]/);
+
+    const searchEnd = sendKeys(base, [{ kind: "char", ch: "/" }, ...typeChars("abc")]).state;
+    const searchMid = sendKeys(searchEnd, [{ kind: "left" }]).state;
+    const searchEarly = sendKeys(searchMid, [{ kind: "left" }]).state;
+    const searchHome = sendKeys(searchEarly, [{ kind: "home" }]).state;
+
+    const rendered = [searchEnd, searchMid, searchEarly, searchHome].map((s) =>
+      renderFrame(s, { cols: 80, rows: 24 }).lines[3] ?? "",
+    );
+    assert.equal(new Set(rendered).size, 4, "all cursor positions must render distinctly without color");
+    assert.match(rendered[0] ?? "", /abc_/);
+    assert.match(rendered[1] ?? "", /ab▏c/);
+    assert.match(rendered[2] ?? "", /a▏bc/);
+    assert.match(rendered[3] ?? "", /▏abc/);
+  });
+
+  it("windows CJK text inputs by display width without clipping cursor or adding leading ellipsis at Home", () => {
+    const snapshot = buildTestSnapshot();
+    const base = createInitialTuiState(snapshot, { colorEnabled: false });
+    const cjk = "日本語プラグイン検索テスト文字列追加";
+
+    const searchTyped = sendKeys(base, [{ kind: "char", ch: "/" }, ...typeChars(cjk)]).state;
+    const endFrame = renderFrame(searchTyped, { cols: 40, rows: 12 });
+    const endSubheader = endFrame.lines[3] ?? "";
+    assert.ok(displayWidth(endSubheader) <= 40);
+    assert.match(endSubheader, /追加_/, "end cursor and newest CJK chars stay visible");
+
+    const searchHome = sendKeys(searchTyped, [{ kind: "home" }]).state;
+    const homeFrame = renderFrame(searchHome, { cols: 40, rows: 12 });
+    const homeSubheader = homeFrame.lines[3] ?? "";
+    assert.ok(displayWidth(homeSubheader) <= 40);
+    assert.match(homeSubheader, /Search \[\/\]: ▏日本/, "Home must never prepend bogus ellipsis");
+    assert.doesNotMatch(homeSubheader, /Search \[\/\]: …/);
+
+    const addTyped = sendKeys(base, [{ kind: "char", ch: "a" }, ...typeChars(cjk)]).state;
+    const addEndFrame = renderFrame(addTyped, { cols: 40, rows: 12 });
+    assert.match(addEndFrame.lines.join("\n"), /追加_/, "Add Marketplace keeps CJK cursor visible");
+    const addHome = sendKeys(addTyped, [{ kind: "home" }]).state;
+    const addHomeFrame = renderFrame(addHome, { cols: 40, rows: 12 });
+    assert.match(addHomeFrame.lines.join("\n"), /Source: ▏日本/);
+    assert.doesNotMatch(addHomeFrame.lines.join("\n"), /Source: …/);
+  });
+
+  it("sanitizes ANSI escapes and control characters from untrusted metadata across tables, headers, toasts, and modals", () => {
+    const evilEntry = makeCatalogItem("cursor-plugins", "evil-plugin", {
+      displayName: "Evil\x1b[2J\x1b[31m\r\n\tPlugin",
+      description: "Line1\r\n\t\x1b]0;pwn\x07\x1b[31mInjected\x1b[0m",
+    });
+    const evilDiag: Diagnostic = {
+      id: makeDiagnosticId("evil", "diag"),
+      severity: "error",
+      subject: { kind: "marketplace", marketplaceId: makeMarketplaceId("bad-mkt") },
+      detail: {
+        kind: "marketplace-sync-failed",
+        marketplaceId: makeMarketplaceId("bad-mkt"),
+        reason: "Fail\x1b[2J\r\n\tReason",
+      },
+      message: "Bad\x1b[31m\r\n\tMessage\x9b2J",
+      hint: "Fix\t\r\n\x1b[1mHint",
+      remediation: {
+        kind: "retry-marketplace-sync",
+        marketplaceId: makeMarketplaceId("bad-mkt"),
+        label: "Retry\x1b[32m\r\n\tSync",
+      },
+    };
+    const evilMkt: MarketplaceRecord = {
+      id: makeMarketplaceId("bad-mkt"),
+      source: { kind: "github", owner: "org", repo: "repo" },
+      addedAt: TS_ISO,
+      sync: {
+        kind: "sync-failed",
+        attemptedAt: TS_ISO,
+        lastGoodSyncAt: null,
+        reason: "Remote\x1b[2J\r\n\tError",
+      },
+      localMirrorPath: null,
+    };
+
+    assert.equal(sanitizeInlineText("a\x1b[31mb\r\n\t\x1b]0;t\x07c"), "ab c");
+
+    const snapshot = buildTestSnapshot({
+      catalog: [evilEntry],
+      marketplaces: [evilMkt],
+      diagnostics: [evilDiag],
+    });
+    const base = createInitialTuiState(snapshot, { colorEnabled: false });
+    const withToast: TuiState = {
+      ...base,
+      toast: { id: 1, tone: "error", text: "Toast\x1b[2J\r\n\tBoom" },
+    };
+
+    const statesToRender: readonly TuiState[] = [
+      withToast,
+      sendKeys(withToast, [{ kind: "enter" }]).state,
+      sendKeys(withToast, [{ kind: "char", ch: "3" }, { kind: "enter" }]).state,
+      sendKeys(withToast, [{ kind: "char", ch: "4" }]).state,
+      sendKeys(withToast, [{ kind: "char", ch: "4" }, { kind: "enter" }]).state,
+    ];
+
+    for (const s of statesToRender) {
+      const frame = renderFrame(s, { cols: 80, rows: 24 });
+      assert.equal(frame.lines.length, 24);
+      for (const line of frame.lines) {
+        assert.equal(stripAnsi(line), line, "no ANSI escapes may leak into NO_COLOR frame");
+        assert.doesNotMatch(line, /[\u0000-\u001f\u007f-\u009f]/, "no C0/C1 control chars may leak");
+      }
+    }
+  });
+
+  it("compacts Stats KPI header at rows <= 15 so data rows remain visible at 40x12 and 80x12", () => {
+    const installed = [
+      makeInstalledItem("user", "alpha-plugin", { tokens: 1200 }),
+      makeInstalledItem("user", "beta-plugin", { tokens: 900 }),
+      makeInstalledItem("user", "gamma-plugin", { tokens: 700 }),
+    ];
+    const snapshot = buildTestSnapshot({ installed });
+    const state = createInitialTuiState(snapshot, { initialTab: "stats", colorEnabled: false });
+
+    for (const vp of [
+      { cols: 40, rows: 12 },
+      { cols: 80, rows: 12 },
+    ]) {
+      const frame = renderFrame(state, vp);
+      assert.equal(frame.lines.length, 12);
+      const joined = frame.lines.join("\n");
+      assert.match(joined, /\[m\] By Plugin/);
+      assert.match(joined, /alpha/, `first stats row visible at ${vp.cols}x${vp.rows}`);
+      assert.match(joined, /beta/, `second stats row visible at ${vp.cols}x${vp.rows}`);
+    }
+
+    const tall = renderFrame(state, { cols: 80, rows: 16 });
+    assert.match(tall.lines.join("\n"), /Discoverable/);
+    assert.match(tall.lines.join("\n"), /Desc Tokens/);
+  });
+
+  it("keeps all 5 header tabs legible at 40 cols and keeps modal buttons unclipped", () => {
+    const diag: Diagnostic = {
+      id: makeDiagnosticId("long", "fix"),
+      severity: "error",
+      subject: { kind: "path", path: makeAbsolutePath(`${USER_PLUGINS_DIR}/broken`) },
+      detail: {
+        kind: "unadapted-hooks-path",
+        sourcePath: makeAbsolutePath(`${USER_PLUGINS_DIR}/broken/hooks.json`),
+        expectedPath: makeAbsolutePath(`${USER_PLUGINS_DIR}/broken/hooks/hooks.json`),
+      },
+      message: "Unadapted hook path detected",
+      hint: "Run remediation",
+      remediation: {
+        kind: "clean-stale-staging",
+        label: "Very long remediation action description that previously clipped the Close button",
+      },
+    };
+    const snapshot = buildTestSnapshot({
+      catalog: [makeCatalogItem("cursor-plugins", "pstack")],
+      installed: [makeInstalledItem("user", "pstack")],
+      diagnostics: [diag],
+    });
+
+    const base = createInitialTuiState(snapshot, { colorEnabled: false });
+    for (const [keyChar, activePattern] of [
+      ["1", /\[1 Disc\]/],
+      ["2", /\[2 Inst 1\]/],
+      ["3", /\[3 Mkts 0\]/],
+      ["4", /\[4 Err 1\]/],
+      ["5", /\[5 Stats\]/],
+    ] as const) {
+      const tabState = sendKeys(base, [{ kind: "char", ch: keyChar }]).state;
+      const header = renderFrame(tabState, { cols: 40, rows: 12 }).lines[1] ?? "";
+      assert.match(header, activePattern);
+      for (const n of ["1", "2", "3", "4", "5"]) {
+        assert.ok(header.includes(n), `tab ${n} visible in 40-col header: ${header}`);
+      }
+    }
+
+    const diagModal = sendKeys(base, [{ kind: "char", ch: "4" }, { kind: "enter" }]).state;
+    for (const vp of [
+      { cols: 40, rows: 12 },
+      { cols: 80, rows: 24 },
+    ]) {
+      const text = renderFrame(diagModal, vp).lines.join("\n");
+      assert.match(text, /Fix:/);
+      assert.match(text, /\[ Close \]/, `Close button must never clip at ${vp.cols}x${vp.rows}`);
+    }
+
+    const installedModal = sendKeys(base, [{ kind: "char", ch: "2" }, { kind: "enter" }]).state;
+    const installedText = renderFrame(installedModal, { cols: 40, rows: 12 }).lines.join("\n");
+    assert.match(installedText, /\[ Disable \]/);
+    assert.match(installedText, /\[ Update \]/);
+    assert.match(installedText, /\[ Uninstall \]/);
+    assert.match(installedText, /\[ Close \]/);
+  });
+
+  it("handles grapheme clusters (ZWJ emoji, skin tone, VS16, combining marks) accurately in width, editing, and overlay", () => {
+    assert.equal(displayWidth("👨‍👩‍👧‍👦"), 2);
+    assert.equal(displayWidth("👩‍💻"), 2);
+    assert.equal(displayWidth("👍🏽"), 2);
+    assert.equal(displayWidth("⚠️"), 2);
+    assert.equal(displayWidth("❤️"), 2);
+    assert.equal(displayWidth("e\u0301"), 1);
+
+    let input = EMPTY_TEXT_INPUT;
+    for (const ch of Array.from("a👨‍👩‍👧‍👦👍🏽⚠️b")) {
+      input = reduceTextInput(input, { kind: "char", ch }).next;
+    }
+    assert.equal(input.value, "a👨‍👩‍👧‍👦👍🏽⚠️b");
+    assert.equal(input.cursor, 5);
+
+    input = reduceTextInput(input, { kind: "backspace" }).next;
+    assert.equal(input.value, "a👨‍👩‍👧‍👦👍🏽⚠️");
+    input = reduceTextInput(input, { kind: "backspace" }).next;
+    assert.equal(input.value, "a👨‍👩‍👧‍👦👍🏽");
+    input = reduceTextInput(input, { kind: "backspace" }).next;
+    assert.equal(input.value, "a👨‍👩‍👧‍👦");
+    input = reduceTextInput(input, { kind: "backspace" }).next;
+    assert.equal(input.value, "a");
+
+    const accented = reduceTextInput(EMPTY_TEXT_INPUT, { kind: "char", ch: "e\u0301" }).next;
+    assert.equal(reduceTextInput(accented, { kind: "backspace" }).next.value, "");
+
+    const bgLine = `│ cafe\u0301 abcde\u0301ghij${" ".repeat(19)} │`;
+    const overlaid = overlaySegmentOnLine(bgLine, 5, "┌MODAL┐", 38, false);
+    assert.equal(displayWidth(overlaid), 38);
+    assert.doesNotMatch(overlaid, /\u0301┌|┐\u0301|│\u0301/, "no combining mark may attach to modal border");
+    assert.ok(overlaid.includes("┌MODAL┐ghij"), `expected clean right continuation, got: ${overlaid}`);
+  });
+
+  it("omits Space toggle hint in installed-detail for broken plugins", () => {
+    const brokenId = makeInstalledPluginId("user", makePluginDirName("broken-plug"));
+    const brokenPlugin: InstalledPlugin = {
+      kind: "broken",
+      id: brokenId,
+      scope: "user",
+      dirName: makePluginDirName("broken-plug"),
+      installPath: makeAbsolutePath(`${USER_PLUGINS_DIR}/broken-plug`),
+      provenance: { kind: "unmanaged" },
+      diskBytes: 128,
+      diagnosticIds: [makeDiagnosticId("broken", "json")],
+    };
+    const validPlugin = makeInstalledItem("user", "valid-plug");
+    const snapshot = buildTestSnapshot({ installed: [brokenPlugin, validPlugin] });
+
+    const brokenModal = sendKeys(
+      createInitialTuiState(snapshot, { initialTab: "installed", colorEnabled: false }),
+      [{ kind: "enter" }],
+    ).state;
+    assert.equal(brokenModal.overlay.kind, "installed-detail");
+    const brokenHints = computeFooterHints(
+      brokenModal,
+      TAB_REGISTRY.installed.prepare(brokenModal),
+      0,
+    );
+    assert.equal(brokenHints.some((h) => h.keys === "Space"), false);
+    const { effects } = sendKeys(brokenModal, [{ kind: "char", ch: " " }]);
+    assert.equal(effects.length, 0);
+
+    const validModal = sendKeys(
+      createInitialTuiState(snapshot, { initialTab: "installed", colorEnabled: false }),
+      [{ kind: "down" }, { kind: "enter" }],
+    ).state;
+    const validHints = computeFooterHints(
+      validModal,
+      TAB_REGISTRY.installed.prepare(validModal),
+      1,
+    );
+    assert.equal(validHints.some((h) => h.keys === "Space" && h.label === "toggle"), true);
+  });
+
+  it("applies ANSI SGR styling cleanly per wrapped line without breaking across lines", () => {
+    const mkt: MarketplaceRecord = {
+      id: makeMarketplaceId("failing-mkt"),
+      source: { kind: "github", owner: "org", repo: "repo" },
+      addedAt: TS_ISO,
+      sync: {
+        kind: "sync-failed",
+        attemptedAt: TS_ISO,
+        lastGoodSyncAt: null,
+        reason:
+          "Network timeout while fetching marketplace metadata from upstream repository mirror after retries",
+      },
+      localMirrorPath: null,
+    };
+    const snapshot = buildTestSnapshot({ marketplaces: [mkt] });
+    const mktModal = sendKeys(
+      createInitialTuiState(snapshot, { initialTab: "marketplaces", colorEnabled: true }),
+      [{ kind: "enter" }],
+    ).state;
+    const frame = renderFrame(mktModal, { cols: 56, rows: 20 });
+    const redLines = frame.lines.filter((line) => line.includes("\x1b[31m") || line.includes("repository mirror"));
+    assert.ok(redLines.length >= 2, "expected wrapped sync-failed error lines");
+    for (const line of redLines) {
+      assert.ok(line.includes("\x1b[31m"), "every wrapped error line must start red SGR");
+      assert.ok(line.includes("Sync failed:") ? line.includes("\x1b[0m") : line.includes("\x1b[31m"));
+      const redIdx = line.indexOf("\x1b[31m");
+      const resetAfterRed = line.indexOf("\x1b[0m", redIdx);
+      assert.ok(resetAfterRed > redIdx, "every red SGR span must reset on the same line");
+    }
+  });
+
+  it("preserves open Add Marketplace and Confirm modals when unrelated background mutations finish", () => {
+    const mkt: MarketplaceRecord = {
+      id: makeMarketplaceId("cursor-plugins"),
+      source: { kind: "github", owner: "cursor", repo: "plugins" },
+      addedAt: TS_ISO,
+      sync: {
+        kind: "synced",
+        syncedAt: TS_ISO,
+        resolvedRef: "main",
+        resolvedSha: "abc",
+        format: "cursor",
+        pluginCount: 1,
+      },
+      localMirrorPath: null,
+    };
+    const snapshot = buildTestSnapshot({
+      revision: 1,
+      marketplaces: [mkt],
+      catalog: [makeCatalogItem("cursor-plugins", "pstack")],
+    });
+    const env = { cwd: WORKSPACE_DIR, homeDir: HOME_DIR };
+
+    const initial = createInitialTuiState(snapshot, { initialTab: "marketplaces", colorEnabled: false });
+    const { state: syncing, effects: syncEffects } = sendKeys(initial, [{ kind: "char", ch: "U" }], env);
+    assert.equal(syncEffects[0]?.kind, "run-mutation");
+    const syncReqId = syncEffects[0]?.kind === "run-mutation" ? syncEffects[0].requestId : makeRequestId(1);
+
+    const { state: typingModal } = sendKeys(
+      syncing,
+      [{ kind: "char", ch: "a" }, ...typeChars("my-org/plugins")],
+      env,
+    );
+    assert.equal(typingModal.overlay.kind, "add-marketplace");
+
+    const updatedSnap = buildTestSnapshot({
+      revision: 2,
+      marketplaces: [mkt],
+      catalog: [makeCatalogItem("cursor-plugins", "pstack")],
+    });
+    const [afterUnrelated] = reduce(
+      typingModal,
+      {
+        kind: "mutation-finished",
+        requestId: syncReqId,
+        label: "Syncing",
+        outcome: {
+          kind: "sync-marketplaces",
+          result: { ok: true, report: { outcomes: [] }, snapshot: updatedSnap },
+        },
+      },
+      env,
+    );
+    assert.equal(afterUnrelated.overlay.kind, "add-marketplace");
+    if (afterUnrelated.overlay.kind === "add-marketplace") {
+      assert.equal(afterUnrelated.overlay.sourceInput.value, "my-org/plugins");
+    }
+
+    const { state: submitted, effects: addEffects } = sendKeys(afterUnrelated, [{ kind: "enter" }], env);
+    assert.equal(addEffects[0]?.kind, "run-mutation");
+    const addReqId = addEffects[0]?.kind === "run-mutation" ? addEffects[0].requestId : makeRequestId(2);
+    const [afterOwnFinish] = reduce(
+      submitted,
+      {
+        kind: "mutation-finished",
+        requestId: addReqId,
+        label: "Adding",
+        outcome: {
+          kind: "add-marketplace",
+          result: {
+            ok: true,
+            report: {
+              outcome: {
+                marketplaceId: makeMarketplaceId("plugins"),
+                status: "synced",
+                pluginCount: 1,
+                format: "cursor",
+              },
+            },
+            snapshot: buildTestSnapshot({ revision: 3, marketplaces: [mkt] }),
+          },
+        },
+      },
+      env,
+    );
+    assert.equal(afterOwnFinish.overlay.kind, "none");
+  });
+
+  it("matches discover-detail installed plugins strictly by provenance and warns on cross-marketplace collisions", () => {
+    const entryA = makeCatalogItem("mkt-a", "foo");
+    const entryB = makeCatalogItem("mkt-b", "foo");
+    const installedFromA = makeInstalledItem("user", "foo", { marketplaceId: "mkt-a" });
+    const snapshot = buildTestSnapshot({
+      catalog: [entryA, entryB],
+      installed: [installedFromA],
+    });
+
+    assert.equal(findInstalledForEntryInScope(snapshot, entryA, "user")?.id, installedFromA.id);
+    assert.equal(findInstalledForEntryInScope(snapshot, entryB, "user"), undefined);
+    assert.equal(findSameNameCollisionInScope(snapshot, entryB, "user")?.id, installedFromA.id);
+
+    const base = createInitialTuiState(snapshot, { colorEnabled: false });
+    const modalB = sendKeys(base, [{ kind: "down" }, { kind: "enter" }]).state;
+    const modalBText = renderFrame(modalB, { cols: 80, rows: 24 }).lines.join("\n");
+    assert.match(modalBText, /\[ Install \]/);
+    assert.doesNotMatch(modalBText, /\[ Uninstall \]/);
+    assert.match(modalBText, /Collision in user scope/);
+
+    const { effects: installBEffects } = sendKeys(modalB, [{ kind: "enter" }]);
+    assert.equal(installBEffects[0]?.kind, "run-mutation");
+    if (installBEffects[0]?.kind === "run-mutation") {
+      assert.equal(installBEffects[0].mutation.kind, "install");
+    }
+  });
+
+  it("flushes incomplete CSI/SS3 prefixes cleanly without hanging or swallowing next keypress", async () => {
+    const decoder = createKeyDecoder();
+    assert.deepEqual(decoder.push(Buffer.from("\x1b[")), []);
+    assert.equal(decoder.hasPendingEscape(), true);
+    assert.deepEqual(decoder.flush(), []);
+    assert.equal(decoder.hasPendingEscape(), false);
+    assert.deepEqual(decoder.push(Buffer.from("a")), [{ kind: "char", ch: "a" }]);
+
+    assert.deepEqual(decoder.push(Buffer.from("\x1bO")), []);
+    assert.equal(decoder.hasPendingEscape(), true);
+    assert.deepEqual(decoder.flush(), []);
+    assert.deepEqual(decoder.push(Buffer.from("b")), [{ kind: "char", ch: "b" }]);
+
+    assert.deepEqual(decoder.push(Buffer.from("\x1b[1;")), []);
+    assert.equal(decoder.hasPendingEscape(), true);
+    assert.deepEqual(decoder.flush(), []);
+    assert.deepEqual(decoder.push(Buffer.from("c")), [{ kind: "char", ch: "c" }]);
+
+    const snapshot = buildTestSnapshot({
+      installed: [makeInstalledItem("user", "pstack")],
+    });
+    const { engine } = createStubEngine(snapshot);
+    const fakeTerm = createFakeTerminal({ cols: 90, rows: 24 });
+    const runPromise = runTui(engine, fakeTerm.port, {
+      escapeFlushMs: 10,
+      spinnerIntervalMs: 20,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    fakeTerm.pushBytes(Buffer.from("\x1b["));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    fakeTerm.pushBytes(Buffer.from("2"));
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    fakeTerm.pushBytes(Buffer.from("q"));
+
+    const exitCode = await runPromise;
+    assert.equal(exitCode, 0);
+    assert.ok(
+      fakeTerm.writes.some((w) => w.includes("2 Installed")),
+      "keypress '2' after flushed incomplete CSI must not be swallowed",
+    );
+  });
+
+  it("respects terminals smaller than 40x12 and renders compact notice strictly within bounds", () => {
+    assert.deepEqual(clampViewport(32, 10), { cols: 32, rows: 10 });
+    assert.deepEqual(clampViewport(1, 1), { cols: 1, rows: 1 });
+
+    const snapshot = buildTestSnapshot({
+      catalog: [makeCatalogItem("cursor-plugins", "pstack")],
+    });
+    const state = createInitialTuiState(snapshot, { colorEnabled: false });
+
+    const f32 = renderFrame(state, { cols: 32, rows: 10 });
+    assert.equal(f32.lines.length, 10);
+    for (const line of f32.lines) {
+      assert.ok(displayWidth(line) <= 32);
+    }
+    const text32 = f32.lines.join("\n");
+    assert.match(text32, /Terminal too small/);
+    assert.match(text32, /32x10/);
+    assert.match(text32, /40x12/);
+    assert.match(text32, /Esc\/q/);
+
+    for (const tiny of [
+      { cols: 20, rows: 6 },
+      { cols: 10, rows: 3 },
+      { cols: 1, rows: 1 },
+    ]) {
+      const f = renderFrame(state, tiny);
+      assert.equal(f.lines.length, tiny.rows);
+      for (const line of f.lines) {
+        assert.ok(displayWidth(line) <= tiny.cols);
+      }
+    }
   });
 });

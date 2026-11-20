@@ -9,9 +9,13 @@ import {
   SYNC_START,
   createTheme,
   displayWidth,
+  graphemeDisplayWidth,
   moveTo,
   overlaySegmentOnLine,
   padVisible,
+  sanitizeInlineText,
+  sanitizeInputText,
+  splitGraphemes,
   truncateVisible,
   wrapText,
 } from "./ansi.ts";
@@ -19,6 +23,7 @@ import type { AnsiTheme } from "./ansi.ts";
 import {
   computeFooterHints,
   findInstalledForEntryInScope,
+  findSameNameCollisionInScope,
   resolveActiveSelectedIndex,
 } from "./reduce.ts";
 import { TAB_IDS } from "./state.ts";
@@ -43,8 +48,8 @@ export function clampViewport(rawCols: number, rawRows: number): Viewport {
   const safeCols = Number.isFinite(rawCols) ? Math.floor(rawCols) : 80;
   const safeRows = Number.isFinite(rawRows) ? Math.floor(rawRows) : 24;
   return {
-    cols: Math.max(40, Math.min(400, safeCols)),
-    rows: Math.max(12, Math.min(200, safeRows)),
+    cols: Math.max(1, Math.min(400, safeCols)),
+    rows: Math.max(1, Math.min(160, safeRows)),
   };
 }
 
@@ -107,7 +112,59 @@ function compactTabLabel(tabId: (typeof TAB_IDS)[number], fullLabel: string): st
   }
 }
 
+function ultraCompactTabLetter(tabId: (typeof TAB_IDS)[number]): string {
+  switch (tabId) {
+    case "discover":
+      return "D";
+    case "installed":
+      return "I";
+    case "marketplaces":
+      return "M";
+    case "errors":
+      return "E";
+    case "stats":
+      return "S";
+    default: {
+      const _exhaustive: never = tabId;
+      return _exhaustive;
+    }
+  }
+}
+
 function renderHeaderLine(state: TuiState, theme: AnsiTheme, innerCols: number): string {
+  if (innerCols <= 48) {
+    const buildNarrowTokens = (includeInactiveBadges: boolean): readonly string[] =>
+      TAB_IDS.map((tabId) => {
+        const desc = TAB_REGISTRY[tabId];
+        const rawBadge = desc.badge(state.snapshot);
+        const safeBadge = rawBadge !== null ? sanitizeInlineText(rawBadge) : "";
+        if (tabId === state.activeTab) {
+          const badgeText = safeBadge.length > 0 ? ` ${safeBadge}` : "";
+          return theme.cyanBold(`[${desc.number} ${compactTabLabel(tabId, desc.label)}${badgeText}]`);
+        }
+        const badgeSuffix = includeInactiveBadges && safeBadge.length > 0 ? `:${safeBadge}` : "";
+        const token = `${desc.number}${ultraCompactTabLetter(tabId)}${badgeSuffix}`;
+        const hasErrorBadge = tabId === "errors" && safeBadge.length > 0;
+        return hasErrorBadge ? theme.yellow(token) : theme.dim(token);
+      });
+
+    let tokens = buildNarrowTokens(true);
+    let line = tokens.join(" ");
+    if (displayWidth(line) > innerCols) {
+      tokens = buildNarrowTokens(false);
+      line = tokens.join(" ");
+    }
+    if (state.pending.kind === "running") {
+      const glyph = SPINNER_FRAMES[state.spinnerTick % SPINNER_FRAMES.length] ?? "⠋";
+      const remaining = innerCols - displayWidth(line) - 2;
+      if (remaining >= 4) {
+        const busyText = truncateVisible(`${glyph} ${sanitizeInlineText(state.pending.label)}`, remaining);
+        line = `${line}  ${theme.yellow(busyText)}`;
+      }
+    }
+    return boxLine(theme, line, innerCols);
+  }
+
   const titleText =
     innerCols >= 88
       ? "Antigravity Plugins"
@@ -120,7 +177,8 @@ function renderHeaderLine(state: TuiState, theme: AnsiTheme, innerCols: number):
   for (const tabId of TAB_IDS) {
     const desc = TAB_REGISTRY[tabId];
     const badge = desc.badge(state.snapshot);
-    const badgeText = badge !== null ? ` ${badge}` : "";
+    const safeBadge = badge !== null ? sanitizeInlineText(badge) : null;
+    const badgeText = safeBadge !== null && safeBadge.length > 0 ? ` ${safeBadge}` : "";
     const label =
       innerCols < 66 && tabId !== state.activeTab
         ? compactTabLabel(tabId, desc.label)
@@ -129,7 +187,7 @@ function renderHeaderLine(state: TuiState, theme: AnsiTheme, innerCols: number):
     if (tabId === state.activeTab) {
       tabTokens.push(theme.cyanBold(`[${rawLabel}]`));
     } else {
-      const hasErrorBadge = tabId === "errors" && badge !== null;
+      const hasErrorBadge = tabId === "errors" && safeBadge !== null;
       tabTokens.push(hasErrorBadge ? theme.yellow(rawLabel) : theme.dim(rawLabel));
     }
   }
@@ -137,12 +195,20 @@ function renderHeaderLine(state: TuiState, theme: AnsiTheme, innerCols: number):
   let busyBadge = "";
   if (state.pending.kind === "running") {
     const glyph = SPINNER_FRAMES[state.spinnerTick % SPINNER_FRAMES.length] ?? "⠋";
-    busyBadge = `  ${theme.yellow(`${glyph} ${state.pending.label}`)}`;
+    busyBadge = `  ${theme.yellow(`${glyph} ${sanitizeInlineText(state.pending.label)}`)}`;
   }
 
   const separator = innerCols >= 84 ? "  " : " ";
   const line = `${titleStyled}${tabTokens.join(separator)}${busyBadge}`;
   return boxLine(theme, line, innerCols);
+}
+
+function sumSliceWidths(widths: readonly number[], start: number, end: number): number {
+  let total = 0;
+  for (let i = start; i < end; i += 1) {
+    total += widths[i] ?? 0;
+  }
+  return total;
 }
 
 function renderTextInputInline(
@@ -152,31 +218,111 @@ function renderTextInputInline(
   maxWidth: number,
   theme: AnsiTheme,
 ): string {
-  if (input.value.length === 0) {
+  if (maxWidth <= 0) {
+    return "";
+  }
+  const safePlaceholder = sanitizeInlineText(placeholder);
+  const safeValue = sanitizeInputText(input.value);
+  if (safeValue.length === 0) {
     if (focused) {
-      const hint = maxWidth > 2 ? ` ${placeholder}` : "";
+      const hint = maxWidth > 2 ? ` ${safePlaceholder}` : "";
       return truncateVisible(`${theme.cyanBold("▏")}${theme.dim(hint)}`, maxWidth, "");
     }
-    return theme.dim(truncateVisible(placeholder, maxWidth));
+    return theme.dim(truncateVisible(safePlaceholder, maxWidth));
   }
   if (!focused) {
-    return truncateVisible(input.value, maxWidth);
+    return truncateVisible(safeValue, maxWidth);
   }
-  const chars = Array.from(input.value);
-  const cursor = Math.max(0, Math.min(chars.length, input.cursor));
-  const before = chars.slice(0, cursor).join("");
-  const atCursor = chars[cursor];
-  const after = atCursor !== undefined ? chars.slice(cursor + 1).join("") : "";
-  const cursorGlyph =
-    atCursor !== undefined ? theme.inverse(atCursor) : theme.cyanBold("_");
 
-  const full = `${before}${cursorGlyph}${after}`;
-  if (displayWidth(full) <= maxWidth) {
-    return full;
+  const graphemes = splitGraphemes(safeValue);
+  const widths = graphemes.map(graphemeDisplayWidth);
+  const cursor = Math.max(0, Math.min(graphemes.length, input.cursor));
+  const cursorGlyph = cursor < graphemes.length ? theme.cyanBold("▏") : theme.cyanBold("_");
+
+  const totalWidth = sumSliceWidths(widths, 0, graphemes.length) + 1;
+  if (totalWidth <= maxWidth) {
+    return `${graphemes.slice(0, cursor).join("")}${cursorGlyph}${graphemes.slice(cursor).join("")}`;
   }
-  const keepTail = Math.max(1, maxWidth - 2);
-  const tailChars = chars.slice(Math.max(0, cursor - keepTail + 1), cursor);
-  return truncateVisible(`…${tailChars.join("")}${cursorGlyph}${after}`, maxWidth, "");
+
+  if (maxWidth <= 3) {
+    const afterText = graphemes.slice(cursor).join("");
+    return truncateVisible(`${cursorGlyph}${afterText}`, maxWidth, "");
+  }
+
+  const prefixWidthToCursor = sumSliceWidths(widths, 0, cursor);
+  const atCursorWidth = cursor < graphemes.length ? (widths[cursor] ?? 0) : 0;
+  const needsTrailAfterCursor = cursor + 1 < graphemes.length;
+  const minNeedFromStart =
+    prefixWidthToCursor + 1 + atCursorWidth + (needsTrailAfterCursor ? 1 : 0);
+
+  let windowStart = 0;
+  let windowEnd = graphemes.length;
+
+  if (minNeedFromStart <= maxWidth) {
+    windowStart = 0;
+    let used = prefixWidthToCursor + 1;
+    windowEnd = cursor;
+    while (windowEnd < graphemes.length) {
+      const w = widths[windowEnd] ?? 0;
+      const trailCost = windowEnd + 1 === graphemes.length ? 0 : 1;
+      if (used + w + trailCost <= maxWidth) {
+        used += w;
+        windowEnd += 1;
+      } else {
+        break;
+      }
+    }
+  } else if (cursor === graphemes.length) {
+    windowEnd = graphemes.length;
+    let budget = Math.max(0, maxWidth - 2);
+    windowStart = graphemes.length;
+    while (windowStart > 0) {
+      const w = widths[windowStart - 1] ?? 0;
+      if (w <= budget) {
+        budget -= w;
+        windowStart -= 1;
+      } else {
+        break;
+      }
+    }
+  } else {
+    const trailReserve = cursor + 1 < graphemes.length ? 1 : 0;
+    let used = 1 + 1 + atCursorWidth;
+    windowEnd = cursor + 1;
+    if (used + trailReserve > maxWidth) {
+      windowStart = cursor;
+      windowEnd = cursor;
+    } else {
+      let budgetBefore = maxWidth - used - trailReserve;
+      windowStart = cursor;
+      while (windowStart > 0) {
+        const w = widths[windowStart - 1] ?? 0;
+        if (w <= budgetBefore) {
+          budgetBefore -= w;
+          used += w;
+          windowStart -= 1;
+        } else {
+          break;
+        }
+      }
+      while (windowEnd < graphemes.length) {
+        const w = widths[windowEnd] ?? 0;
+        const trailCost = windowEnd + 1 === graphemes.length ? 0 : 1;
+        if (used + w + trailCost <= maxWidth) {
+          used += w;
+          windowEnd += 1;
+        } else {
+          break;
+        }
+      }
+    }
+  }
+
+  const lead = windowStart > 0 ? "…" : "";
+  const trail = windowEnd < graphemes.length ? "…" : "";
+  const before = graphemes.slice(windowStart, cursor).join("");
+  const after = graphemes.slice(cursor, windowEnd).join("");
+  return truncateVisible(`${lead}${before}${cursorGlyph}${after}${trail}`, maxWidth, "");
 }
 
 function renderSearchSubheader(
@@ -186,8 +332,9 @@ function renderSearchSubheader(
   theme: AnsiTheme,
   innerCols: number,
 ): string {
+  const safeMode = sanitizeInlineText(modeBadgeText);
   if (state.activeTab === "stats") {
-    return boxLine(theme, applyTone(theme, modeTone, modeBadgeText), innerCols);
+    return boxLine(theme, applyTone(theme, modeTone, safeMode), innerCols);
   }
   const searchState = state.searchByTab[state.activeTab];
   const isSearchFocused = state.overlay.kind === "search-input";
@@ -197,7 +344,7 @@ function renderSearchSubheader(
     : theme.dim(prefixPlain);
 
   const badgeStyled =
-    modeBadgeText.length > 0 ? applyTone(theme, modeTone, modeBadgeText) : "";
+    safeMode.length > 0 ? applyTone(theme, modeTone, safeMode) : "";
   const badgeWidth = displayWidth(badgeStyled);
   const gap = badgeWidth > 0 ? 2 : 0;
   const inputMax = Math.max(8, innerCols - prefixPlain.length - badgeWidth - gap);
@@ -217,12 +364,37 @@ function renderSearchSubheader(
   return boxLine(theme, composed, innerCols);
 }
 
+function renderCompactStatsLine(
+  cards: readonly SummaryCard[],
+  modeBadgeText: string,
+  theme: AnsiTheme,
+  innerCols: number,
+): readonly string[] {
+  const val = (index: number): string => sanitizeInlineText(cards[index]?.value ?? "-");
+  const shortMode = sanitizeInlineText(modeBadgeText).replace(/^View\s+\[m\]:\s*/i, "[m] ");
+  const rightPart = shortMode.length > 0 ? theme.cyan(shortMode) : "";
+  const rightWidth = displayWidth(rightPart);
+  const leftMax = Math.max(8, innerCols - (rightWidth > 0 ? rightWidth + 1 : 0));
+  const leftRaw =
+    innerCols >= 64
+      ? `Disc: ${val(0)} · Inst: ${val(1)} · Tokens: ${val(3)} · Disk: ${val(4)}`
+      : `D:${val(0)} I:${val(1)} ${val(4)}`;
+  const leftPart = truncateVisible(leftRaw, leftMax);
+  const leftWidth = displayWidth(leftPart);
+  const composed =
+    rightWidth > 0
+      ? `${leftPart}${" ".repeat(Math.max(1, innerCols - leftWidth - rightWidth))}${rightPart}`
+      : leftPart;
+  return [boxLine(theme, composed, innerCols)];
+}
+
 function renderStatsCardsLines(
   cards: readonly SummaryCard[],
   modeBadgeText: string,
   theme: AnsiTheme,
   innerCols: number,
 ): readonly string[] {
+  const safeMode = sanitizeInlineText(modeBadgeText);
   const count = Math.max(1, cards.length);
   const gapWidth = 2;
   const totalGaps = (count - 1) * gapWidth;
@@ -239,20 +411,20 @@ function renderStatsCardsLines(
     const width = isLast
       ? Math.max(8, innerCols - (cardWidth + gapWidth) * (cards.length - 1))
       : cardWidth;
-    labelCells.push(theme.dim(padVisible(card.label, width, "left")));
-    valueCells.push(applyTone(theme, card.tone, padVisible(card.value, width, "left")));
-    subCells.push(theme.dim(padVisible(card.subtext ?? "", width, "left")));
+    labelCells.push(theme.dim(padVisible(sanitizeInlineText(card.label), width, "left")));
+    valueCells.push(applyTone(theme, card.tone, padVisible(sanitizeInlineText(card.value), width, "left")));
+    subCells.push(theme.dim(padVisible(sanitizeInlineText(card.subtext ?? ""), width, "left")));
   }
 
   const sep = " ".repeat(gapWidth);
   const line1 = boxLine(theme, labelCells.join(sep), innerCols);
   const line2 = boxLine(theme, valueCells.join(sep), innerCols);
   const subWithMode =
-    modeBadgeText.length > 0 ? theme.cyan(modeBadgeText) : subCells.join(sep);
+    safeMode.length > 0 ? theme.cyan(safeMode) : subCells.join(sep);
   const line3 = boxLine(
     theme,
-    innerCols >= 80 && modeBadgeText.length > 0
-      ? `${padVisible(subCells.slice(0, 3).join(sep), Math.max(20, innerCols - displayWidth(modeBadgeText) - 2), "left")}  ${theme.cyan(modeBadgeText)}`
+    innerCols >= 80 && safeMode.length > 0
+      ? `${padVisible(subCells.slice(0, 3).join(sep), Math.max(20, innerCols - displayWidth(safeMode) - 2), "left")}  ${theme.cyan(safeMode)}`
       : subWithMode,
     innerCols,
   );
@@ -389,6 +561,7 @@ function renderToastLine(state: TuiState, theme: AnsiTheme, innerCols: number): 
     return null;
   }
   const { tone, text } = state.toast;
+  const safeText = sanitizeInlineText(text);
   const prefix =
     tone === "error"
       ? "✖ "
@@ -405,7 +578,7 @@ function renderToastLine(state: TuiState, theme: AnsiTheme, innerCols: number): 
         : tone === "success"
           ? "success"
           : "accent";
-  return boxLine(theme, applyTone(theme, cellTone, `${prefix}${text}`), innerCols);
+  return boxLine(theme, applyTone(theme, cellTone, `${prefix}${safeText}`), innerCols);
 }
 
 function renderButton(
@@ -413,30 +586,102 @@ function renderButton(
   focused: boolean,
   theme: AnsiTheme,
 ): string {
-  const text = `[ ${label} ]`;
-  return focused ? theme.focusedButton(text) : theme.dim(text);
+  const prefix = focused ? "▸ " : "  ";
+  const bracketed = `[ ${sanitizeInlineText(label)} ]`;
+  return focused
+    ? `${theme.cyanBold(prefix)}${theme.focusedButton(bracketed)}`
+    : `${prefix}${theme.dim(bracketed)}`;
+}
+
+function layoutModalButtons(
+  buttons: readonly string[],
+  innerWidth: number,
+): readonly string[] {
+  if (buttons.length === 0) {
+    return [];
+  }
+  const twoSpace = buttons.join("  ");
+  if (displayWidth(twoSpace) <= innerWidth) {
+    return [twoSpace];
+  }
+  const oneSpace = buttons.join(" ");
+  if (displayWidth(oneSpace) <= innerWidth) {
+    return [oneSpace];
+  }
+
+  const rows: string[] = [];
+  let current = "";
+  for (const btn of buttons) {
+    if (current.length === 0) {
+      current = btn;
+      continue;
+    }
+    const candidate = `${current} ${btn}`;
+    if (displayWidth(candidate) <= innerWidth) {
+      current = candidate;
+    } else {
+      rows.push(current);
+      current = btn;
+    }
+  }
+  if (current.length > 0) {
+    rows.push(current);
+  }
+  return rows;
+}
+
+function wrapStyledText(
+  text: string,
+  maxWidth: number,
+  style: (line: string) => string,
+): readonly string[] {
+  return wrapText(sanitizeInlineText(text), maxWidth).map(style);
 }
 
 function buildModalBoxLines(
   title: string,
   bodyLines: readonly string[],
-  buttonsLine: string | null,
+  buttons: readonly string[],
   modalWidth: number,
   maxModalHeight: number,
   theme: AnsiTheme,
 ): readonly string[] {
+  const safeTitle = sanitizeInlineText(title);
   const inner = Math.max(10, modalWidth - 4);
   const borderV = theme.cyan("│");
-  const top = theme.cyan(`┌${"─".repeat(modalWidth - 2)}┐`);
-  const mid = theme.cyan(`├${"─".repeat(modalWidth - 2)}┤`);
-  const bot = theme.cyan(`└${"─".repeat(modalWidth - 2)}┘`);
+  const bot = theme.cyan(`└${"─".repeat(Math.max(0, modalWidth - 2))}┘`);
+  const buttonLines = layoutModalButtons(buttons, inner);
+  const compact = maxModalHeight <= 6;
 
-  const titleLabel = truncateVisible(title, Math.max(4, inner - 6));
+  if (compact) {
+    const maxTitleW = Math.max(4, modalWidth - 11);
+    const titleLabel = truncateVisible(safeTitle, maxTitleW);
+    const dashCount = Math.max(1, modalWidth - 10 - displayWidth(titleLabel));
+    const topTitle =
+      `${theme.cyan("┌─ ")}${theme.whiteBold(titleLabel)} ${theme.cyan("─".repeat(dashCount))}${theme.dim("[Esc]")}${theme.cyan("┐")}`;
+    const chromeRows = 2 + buttonLines.length;
+    const maxBodyRows = Math.max(0, maxModalHeight - chromeRows);
+    const clippedBody = bodyLines.slice(0, maxBodyRows);
+
+    const lines: string[] = [topTitle];
+    for (const row of clippedBody) {
+      lines.push(`${borderV} ${padVisible(row, inner, "left")} ${borderV}`);
+    }
+    for (const btnRow of buttonLines) {
+      lines.push(`${borderV} ${padVisible(btnRow, inner, "left")} ${borderV}`);
+    }
+    lines.push(bot);
+    return lines;
+  }
+
+  const top = theme.cyan(`┌${"─".repeat(Math.max(0, modalWidth - 2))}┐`);
+  const mid = theme.cyan(`├${"─".repeat(Math.max(0, modalWidth - 2))}┤`);
+  const titleLabel = truncateVisible(safeTitle, Math.max(4, inner - 6));
   const escBadge = theme.dim("[Esc]");
   const titlePad = Math.max(1, inner - displayWidth(titleLabel) - 5);
   const titleRow = `${borderV} ${theme.whiteBold(titleLabel)}${" ".repeat(titlePad)}${escBadge} ${borderV}`;
 
-  const chromeRows = buttonsLine !== null ? 6 : 4;
+  const chromeRows = buttonLines.length > 0 ? 5 + buttonLines.length : 4;
   const maxBodyRows = Math.max(1, maxModalHeight - chromeRows);
   const clippedBody = bodyLines.slice(0, maxBodyRows);
 
@@ -444,9 +689,11 @@ function buildModalBoxLines(
   for (const row of clippedBody) {
     lines.push(`${borderV} ${padVisible(row, inner, "left")} ${borderV}`);
   }
-  if (buttonsLine !== null) {
+  if (buttonLines.length > 0) {
     lines.push(mid);
-    lines.push(`${borderV} ${padVisible(buttonsLine, inner, "left")} ${borderV}`);
+    for (const btnRow of buttonLines) {
+      lines.push(`${borderV} ${padVisible(btnRow, inner, "left")} ${borderV}`);
+    }
   }
   lines.push(bot);
   return lines;
@@ -470,6 +717,7 @@ function renderOverlayLines(
   state: TuiState,
   overlay: Exclude<OverlayState, { readonly kind: "none" | "search-input" }>,
   viewport: Viewport,
+  maxModalHeight: number,
   theme: AnsiTheme,
 ): readonly string[] {
   const modalWidth = Math.max(
@@ -477,37 +725,65 @@ function renderOverlayLines(
     Math.min(82, viewport.cols - 6),
   );
   const inner = Math.max(10, modalWidth - 4);
-  const maxModalHeight = Math.max(8, viewport.rows - 2);
 
   switch (overlay.kind) {
     case "discover-detail": {
       const entry = state.snapshot.catalogById.get(overlay.entryId);
       if (entry === undefined) {
-        return buildModalBoxLines("Plugin Details", ["Plugin no longer in catalog."], null, modalWidth, maxModalHeight, theme);
+        return buildModalBoxLines("Plugin Details", ["Plugin no longer in catalog."], [], modalWidth, maxModalHeight, theme);
       }
       const installed = findInstalledForEntryInScope(state.snapshot, entry, overlay.targetScope);
+      const collision =
+        installed === undefined
+          ? findSameNameCollisionInScope(state.snapshot, entry, overlay.targetScope)
+          : undefined;
       const primaryLabel = installed !== undefined ? "Uninstall" : "Install";
-      const meta = `Version: ${entry.version ?? "-"}   Author: ${entry.author ?? "-"}   Format: ${entry.sourceFormat}`;
-      const body: string[] = [
+      const safeName = sanitizeInlineText(entry.name);
+      const safeId = sanitizeInlineText(entry.id);
+      const safeVer = sanitizeInlineText(entry.version ?? "-");
+      const safeAuthor = sanitizeInlineText(entry.author ?? "-");
+      const safeDesc = sanitizeInlineText(entry.description || "No description provided.");
+      const meta =
+        maxModalHeight <= 6
+          ? `Scope: ${overlay.targetScope} · Ver: ${safeVer} · ${entry.sourceFormat}`
+          : `Version: ${safeVer}   Author: ${safeAuthor}   Format: ${entry.sourceFormat}`;
+
+      const body: string[] = [];
+      if (collision !== undefined) {
+        const sourceDesc =
+          collision.provenance.kind === "marketplace"
+            ? collision.provenance.entryId
+            : collision.provenance.kind === "direct"
+              ? `direct (${collision.provenance.installSource.kind})`
+              : "unmanaged local plugin";
+        body.push(
+          ...wrapStyledText(
+            `Collision in ${overlay.targetScope} scope: "${safeName}" is installed as ${collision.id} from ${sourceDesc}.`,
+            inner,
+            (line) => theme.yellow(line),
+          ),
+        );
+      }
+      body.push(
         theme.dim(meta),
-        ...wrapText(`Summary: ${entry.description || "No description provided."}`, inner),
+        ...wrapText(`Summary: ${safeDesc}`, inner),
         ...wrapText(`Components: ${describeCatalogEntryComponents(entry)}`, inner),
-      ];
+      );
       if (entry.componentsPreview !== null && entry.componentsPreview.skills.length > 0) {
-        const names = entry.componentsPreview.skills.slice(0, 8).map((s) => s.name);
+        const names = entry.componentsPreview.skills
+          .slice(0, 8)
+          .map((s) => sanitizeInlineText(s.name));
         const suffix =
           entry.componentsPreview.skills.length > 8
             ? `, +${entry.componentsPreview.skills.length - 8} more`
             : "";
         body.push(...wrapText(`Skills: ${names.join(", ")}${suffix}`, inner));
       }
-      const userDir = joinAbsolutePath(
-        state.snapshot.paths.userPluginsDir,
-        entry.slug,
+      const userDir = sanitizeInlineText(
+        joinAbsolutePath(state.snapshot.paths.userPluginsDir, entry.slug),
       );
-      const projDir = joinAbsolutePath(
-        state.snapshot.paths.projectPluginsDir,
-        entry.slug,
+      const projDir = sanitizeInlineText(
+        joinAbsolutePath(state.snapshot.paths.projectPluginsDir, entry.slug),
       );
       body.push("");
       body.push(
@@ -520,9 +796,9 @@ function renderOverlayLines(
         renderButton(primaryLabel, overlay.focusedButton === "primary", theme),
         renderButton("Switch Scope", overlay.focusedButton === "scope", theme),
         renderButton("Close", overlay.focusedButton === "close", theme),
-      ].join("   ");
+      ];
       return buildModalBoxLines(
-        `Plugin Details: ${entry.name} (${entry.id})`,
+        `Plugin Details: ${safeName} (${safeId})`,
         body,
         buttons,
         modalWidth,
@@ -534,23 +810,27 @@ function renderOverlayLines(
     case "installed-detail": {
       const plugin = state.snapshot.installedById.get(overlay.pluginId);
       if (plugin === undefined) {
-        return buildModalBoxLines("Installed Plugin", ["Plugin was removed."], null, modalWidth, maxModalHeight, theme);
+        return buildModalBoxLines("Installed Plugin", ["Plugin was removed."], [], modalWidth, maxModalHeight, theme);
       }
       const body: string[] = [];
+      const safeId = sanitizeInlineText(plugin.id);
+      const safePath = sanitizeInlineText(plugin.installPath);
       if (plugin.kind === "valid") {
+        const safeName = sanitizeInlineText(plugin.manifest.name);
+        const safeVer = sanitizeInlineText(plugin.manifest.version ?? "-");
         const stateText =
           plugin.activation.kind === "shadowed"
-            ? `shadowed by ${plugin.activation.shadowedBy}`
+            ? `shadowed by ${sanitizeInlineText(plugin.activation.shadowedBy)}`
             : plugin.activation.kind;
-        body.push(
-          `Scope: ${plugin.scope}   State: ${stateText}   Version: ${plugin.manifest.version ?? "-"}`,
-        );
-        body.push(`Path: ${plugin.installPath}`);
+        body.push(`Scope: ${plugin.scope}   State: ${stateText}   Version: ${safeVer}`);
+        body.push(`Path: ${safePath}`);
         body.push(
           `Footprint: ${formatBytes(plugin.diskBytes)} · ~${plugin.estimatedDescriptionTokens} desc tokens`,
         );
         if (plugin.manifest.description !== undefined) {
-          body.push(...wrapText(`Summary: ${plugin.manifest.description}`, inner));
+          body.push(
+            ...wrapText(`Summary: ${sanitizeInlineText(plugin.manifest.description)}`, inner),
+          );
         }
         const c = plugin.components.counts;
         body.push(
@@ -558,8 +838,10 @@ function renderOverlayLines(
         );
         if (plugin.updateAvailable !== null) {
           body.push(
-            theme.yellow(
+            ...wrapStyledText(
               `Update available: ${plugin.updateAvailable.latestVersion} (${plugin.updateAvailable.sourceEntryId})`,
+              inner,
+              (line) => theme.yellow(line),
             ),
           );
         }
@@ -571,23 +853,24 @@ function renderOverlayLines(
         btns.push(renderButton("Uninstall", overlay.focusedAction === "uninstall", theme));
         btns.push(renderButton("Close", overlay.focusedAction === "close", theme));
         return buildModalBoxLines(
-          `Installed: ${plugin.manifest.name} (${plugin.id})`,
+          `Installed: ${safeName} (${safeId})`,
           body,
-          btns.join("  "),
+          btns,
           modalWidth,
           maxModalHeight,
           theme,
         );
       }
+      const safeDirName = sanitizeInlineText(plugin.dirName);
       body.push(theme.red(`Status: BROKEN (${plugin.diagnosticIds.length} diagnostic(s))`));
-      body.push(`Path: ${plugin.installPath}`);
+      body.push(`Path: ${safePath}`);
       body.push(`Disk: ${formatBytes(plugin.diskBytes)}`);
       const btns = [
         renderButton("Uninstall", overlay.focusedAction === "uninstall", theme),
         renderButton("Close", overlay.focusedAction === "close", theme),
-      ].join("   ");
+      ];
       return buildModalBoxLines(
-        `Broken Plugin: ${plugin.dirName} (${plugin.id})`,
+        `Broken Plugin: ${safeDirName} (${safeId})`,
         body,
         btns,
         modalWidth,
@@ -599,37 +882,46 @@ function renderOverlayLines(
     case "marketplace-detail": {
       const mkt = state.snapshot.marketplacesById.get(overlay.marketplaceId);
       if (mkt === undefined) {
-        return buildModalBoxLines("Marketplace", ["Marketplace was removed."], null, modalWidth, maxModalHeight, theme);
+        return buildModalBoxLines("Marketplace", ["Marketplace was removed."], [], modalWidth, maxModalHeight, theme);
       }
+      const safeMktId = sanitizeInlineText(mkt.id);
+      const safeSource = sanitizeInlineText(formatMarketplaceSource(mkt.source));
+      const safeAdded = sanitizeInlineText(mkt.addedAt);
       const body: string[] = [
-        `ID: ${mkt.id}   Kind: ${mkt.source.kind}`,
-        `Source: ${formatMarketplaceSource(mkt.source)}`,
-        `Added: ${mkt.addedAt}`,
+        `ID: ${safeMktId}   Kind: ${mkt.source.kind}`,
+        `Source: ${safeSource}`,
+        `Added: ${safeAdded}`,
       ];
       if (mkt.localMirrorPath !== null) {
-        body.push(`Mirror: ${mkt.localMirrorPath}`);
+        body.push(`Mirror: ${sanitizeInlineText(mkt.localMirrorPath)}`);
       }
       if (mkt.sync.kind === "synced") {
         body.push(
-          theme.green(
+          ...wrapStyledText(
             `Sync: synced (${mkt.sync.pluginCount} plugins · ${mkt.sync.format} · ${mkt.sync.syncedAt})`,
+            inner,
+            (line) => theme.green(line),
           ),
         );
         if (mkt.sync.resolvedRef !== null) {
-          body.push(`Ref: ${mkt.sync.resolvedRef} (${mkt.sync.resolvedSha ?? "-"})`);
+          body.push(
+            `Ref: ${sanitizeInlineText(mkt.sync.resolvedRef)} (${sanitizeInlineText(mkt.sync.resolvedSha ?? "-")})`,
+          );
         }
       } else if (mkt.sync.kind === "never-synced") {
         body.push(theme.yellow("Sync: never synced"));
       } else {
-        body.push(...wrapText(theme.red(`Sync failed: ${mkt.sync.reason}`), inner));
+        body.push(
+          ...wrapStyledText(`Sync failed: ${mkt.sync.reason}`, inner, (line) => theme.red(line)),
+        );
       }
       const buttons = [
         renderButton("Update", overlay.focusedAction === "update", theme),
         renderButton("Remove", overlay.focusedAction === "remove", theme),
         renderButton("Close", overlay.focusedAction === "close", theme),
-      ].join("   ");
+      ];
       return buildModalBoxLines(
-        `Marketplace: ${mkt.id}`,
+        `Marketplace: ${safeMktId}`,
         body,
         buttons,
         modalWidth,
@@ -673,22 +965,30 @@ function renderOverlayLines(
       } else if (overlay.preview.kind === "valid") {
         const chosenId =
           overlay.idInput.value.trim().length > 0
-            ? overlay.idInput.value.trim()
-            : overlay.preview.suggestedId;
+            ? sanitizeInlineText(overlay.idInput.value)
+            : sanitizeInlineText(overlay.preview.suggestedId);
         body.push(
           theme.green(
             `Detected: ${overlay.preview.source.kind}   ID: ${chosenId}`,
           ),
         );
-        body.push(theme.dim(`Resolved: ${formatMarketplaceSource(overlay.preview.source)}`));
+        body.push(
+          theme.dim(
+            `Resolved: ${sanitizeInlineText(formatMarketplaceSource(overlay.preview.source))}`,
+          ),
+        );
       } else {
-        body.push(...wrapText(theme.red(`Invalid source: ${overlay.preview.message}`), inner));
+        body.push(
+          ...wrapStyledText(`Invalid source: ${overlay.preview.message}`, inner, (line) =>
+            theme.red(line),
+          ),
+        );
       }
 
       const buttons = [
         renderButton("Add Marketplace", overlay.focusedField === "submit", theme),
         renderButton("Cancel", overlay.focusedField === "cancel", theme),
-      ].join("   ");
+      ];
       return buildModalBoxLines(
         "Add Marketplace",
         body,
@@ -702,25 +1002,37 @@ function renderOverlayLines(
     case "diagnostic-detail": {
       const diag: Diagnostic | undefined = state.snapshot.diagnosticsById.get(overlay.diagnosticId);
       if (diag === undefined) {
-        return buildModalBoxLines("Diagnostic", ["Diagnostic resolved."], null, modalWidth, maxModalHeight, theme);
+        return buildModalBoxLines("Diagnostic", ["Diagnostic resolved."], [], modalWidth, maxModalHeight, theme);
       }
+      const safeKind = sanitizeInlineText(diag.detail.kind);
       const body: string[] = [
-        `Severity: ${diag.severity.toUpperCase()}   Code: ${diag.detail.kind}`,
-        ...wrapText(`Message: ${diag.message}`, inner),
-        ...wrapText(`Hint: ${diag.hint}`, inner),
+        `Severity: ${diag.severity.toUpperCase()}   Code: ${safeKind}`,
+        ...wrapText(`Message: ${sanitizeInlineText(diag.message)}`, inner),
+        ...wrapText(`Hint: ${sanitizeInlineText(diag.hint)}`, inner),
       ];
       if (diag.remediation !== undefined) {
-        body.push(theme.green(`Auto-fix: ${diag.remediation.label}`));
+        body.push(
+          ...wrapStyledText(
+            `Auto-fix: ${diag.remediation.label}`,
+            inner,
+            (line) => theme.green(line),
+          ),
+        );
       }
       const btns: string[] = [];
       if (diag.remediation !== undefined) {
-        btns.push(renderButton(`Fix: ${diag.remediation.label}`, overlay.focusedAction === "fix", theme));
+        const maxFixLabel = Math.max(8, inner - 19);
+        const fixLabel = truncateVisible(
+          `Fix: ${sanitizeInlineText(diag.remediation.label)}`,
+          maxFixLabel,
+        );
+        btns.push(renderButton(fixLabel, overlay.focusedAction === "fix", theme));
       }
       btns.push(renderButton("Close", overlay.focusedAction === "close", theme));
       return buildModalBoxLines(
-        `Diagnostic: ${diag.detail.kind}`,
+        `Diagnostic: ${safeKind}`,
         body,
-        btns.join("   "),
+        btns,
         modalWidth,
         maxModalHeight,
         theme,
@@ -728,11 +1040,11 @@ function renderOverlayLines(
     }
 
     case "confirm": {
-      const body = wrapText(overlay.message, inner);
+      const body = wrapText(sanitizeInlineText(overlay.message), inner);
       const buttons = [
         renderButton(overlay.confirmLabel, overlay.focusedChoice === "confirm", theme),
         renderButton("Cancel", overlay.focusedChoice === "cancel", theme),
-      ].join("   ");
+      ];
       return buildModalBoxLines(
         overlay.title,
         body,
@@ -762,7 +1074,7 @@ function renderOverlayLines(
       return buildModalBoxLines(
         "Antigravity Plugin Manager Help",
         body,
-        renderButton("Close", true, theme),
+        [renderButton("Close", true, theme)],
         modalWidth,
         maxModalHeight,
         theme,
@@ -776,11 +1088,58 @@ function renderOverlayLines(
   }
 }
 
+function renderTooSmallFrame(viewport: Viewport, theme: AnsiTheme): RenderedFrame {
+  const message = `Terminal too small (${viewport.cols}x${viewport.rows}). Resize to at least 40x12. Esc/q to quit.`;
+  const lines: string[] = [];
+
+  if (viewport.cols >= 12 && viewport.rows >= 5) {
+    const inner = viewport.cols - 4;
+    const wrapped = wrapText(message, inner);
+    const contentRows = viewport.rows - 2;
+    const shown = wrapped.slice(0, contentRows);
+    const topPad = Math.max(0, Math.floor((contentRows - shown.length) / 2));
+
+    lines.push(renderTopBorder(theme, viewport.cols));
+    for (let r = 0; r < contentRows; r += 1) {
+      const text = shown[r - topPad];
+      lines.push(
+        boxLine(
+          theme,
+          text !== undefined ? theme.yellow(padVisible(text, inner, "center")) : "",
+          inner,
+        ),
+      );
+    }
+    lines.push(renderBottomBorder(theme, viewport.cols));
+  } else {
+    const wrapped =
+      viewport.rows === 1
+        ? [truncateVisible(message, viewport.cols, "")]
+        : wrapText(message, viewport.cols);
+    for (let r = 0; r < viewport.rows; r += 1) {
+      const rowText = wrapped[r] ?? "";
+      lines.push(theme.yellow(truncateVisible(rowText, viewport.cols, "")));
+    }
+  }
+
+  return {
+    viewport,
+    lines: lines.map((line) =>
+      displayWidth(line) > viewport.cols ? truncateVisible(line, viewport.cols, "") : line,
+    ),
+    cursor: null,
+  };
+}
+
 export function renderFrame(state: TuiState, rawViewport: Viewport): RenderedFrame {
   const viewport = clampViewport(rawViewport.cols, rawViewport.rows);
-  const innerCols = Math.max(10, viewport.cols - 4);
   const theme = createTheme(state.colorEnabled);
 
+  if (viewport.cols < 40 || viewport.rows < 12) {
+    return renderTooSmallFrame(viewport, theme);
+  }
+
+  const innerCols = Math.max(10, viewport.cols - 4);
   const prepared = TAB_REGISTRY[state.activeTab].prepare(state);
   const selectedIndex = resolveActiveSelectedIndex(state, prepared);
 
@@ -791,13 +1150,11 @@ export function renderFrame(state: TuiState, rawViewport: Viewport): RenderedFra
   ];
 
   if (state.activeTab === "stats" && prepared.summaryCards.length > 0) {
+    const modeText = prepared.modeBadge?.text ?? "";
     topLines.push(
-      ...renderStatsCardsLines(
-        prepared.summaryCards,
-        prepared.modeBadge?.text ?? "",
-        theme,
-        innerCols,
-      ),
+      ...(viewport.rows <= 15
+        ? renderCompactStatsLine(prepared.summaryCards, modeText, theme, innerCols)
+        : renderStatsCardsLines(prepared.summaryCards, modeText, theme, innerCols)),
     );
   } else {
     topLines.push(
@@ -833,7 +1190,7 @@ export function renderFrame(state: TuiState, rawViewport: Viewport): RenderedFra
   const colWidths = computeColumnWidths(prepared.columns, Math.max(4, tableWidth - prefixCols));
 
   const headerCells = prepared.columns.map((col, idx) =>
-    theme.dim(padVisible(col.header, colWidths[idx] ?? 1, col.align)),
+    theme.dim(padVisible(sanitizeInlineText(col.header), colWidths[idx] ?? 1, col.align)),
   );
   const headerLine = boxLine(
     theme,
@@ -845,10 +1202,11 @@ export function renderFrame(state: TuiState, rawViewport: Viewport): RenderedFra
   const bodyLines: string[] = [];
   if (prepared.rowCount === 0) {
     const emptyLineIdx = Math.floor(bodyRows / 2);
+    const safeEmpty = sanitizeInlineText(prepared.emptyMessage);
     for (let r = 0; r < bodyRows; r += 1) {
       if (r === emptyLineIdx) {
         bodyLines.push(
-          boxLine(theme, theme.dim(padVisible(prepared.emptyMessage, innerCols, "center")), innerCols),
+          boxLine(theme, theme.dim(padVisible(safeEmpty, innerCols, "center")), innerCols),
         );
       } else {
         bodyLines.push(boxLine(theme, "", innerCols));
@@ -898,7 +1256,8 @@ export function renderFrame(state: TuiState, rawViewport: Viewport): RenderedFra
         const col = prepared.columns[c];
         const cell = cells[c];
         const width = colWidths[c] ?? 1;
-        const rawPadded = padVisible(cell?.text ?? "", width, col?.align ?? "left");
+        const safeCellText = sanitizeInlineText(cell?.text ?? "");
+        const rawPadded = padVisible(safeCellText, width, col?.align ?? "left");
         renderedCells.push(isSelected ? rawPadded : applyTone(theme, cell?.tone, rawPadded));
       }
 
@@ -923,16 +1282,26 @@ export function renderFrame(state: TuiState, rawViewport: Viewport): RenderedFra
   }
 
   if (state.overlay.kind !== "none" && state.overlay.kind !== "search-input") {
-    const modalLines = renderOverlayLines(state, state.overlay, viewport, theme);
+    const spaceBetweenBars = viewport.rows - topLines.length - bottomLines.length;
+    const bandTop = spaceBetweenBars >= 7 ? topLines.length : Math.min(topLines.length, 3);
+    const bandBottom = Math.max(bandTop, viewport.rows - bottomLines.length);
+    const maxModalHeight = Math.max(1, bandBottom - bandTop);
+    const modalLines = renderOverlayLines(state, state.overlay, viewport, maxModalHeight, theme);
+    const modalHeight = Math.min(modalLines.length, maxModalHeight);
     const modalW = displayWidth(modalLines[0] ?? "");
     const startCol = Math.max(0, Math.floor((viewport.cols - modalW) / 2));
-    const startRow = Math.max(1, Math.floor((viewport.rows - modalLines.length) / 2));
+    const startRow = bandTop + Math.max(0, Math.floor((maxModalHeight - modalHeight) / 2));
     const composited = [...frameLines];
-    for (let i = 0; i < modalLines.length; i += 1) {
+    for (let i = 0; i < modalHeight; i += 1) {
       const targetRow = startRow + i;
       const modalLine = modalLines[i];
       const bgLine = composited[targetRow];
-      if (targetRow >= viewport.rows - 1 || modalLine === undefined || bgLine === undefined) {
+      if (
+        targetRow < bandTop ||
+        targetRow >= bandBottom ||
+        modalLine === undefined ||
+        bgLine === undefined
+      ) {
         continue;
       }
       composited[targetRow] = overlaySegmentOnLine(

@@ -157,8 +157,7 @@ export function createKeyDecoder(): KeyDecoder {
             if (!flushEnd) {
               break;
             }
-            events.push({ kind: "escape" });
-            i += 1;
+            i = j;
             continue;
           }
           const finalByte = pending[j];
@@ -171,7 +170,7 @@ export function createKeyDecoder(): KeyDecoder {
             i = j + 1;
             continue;
           }
-          i += 2;
+          i = j;
           continue;
         }
         if (next === 0x4f) {
@@ -179,8 +178,7 @@ export function createKeyDecoder(): KeyDecoder {
             if (!flushEnd) {
               break;
             }
-            events.push({ kind: "escape" });
-            i += 1;
+            i += 2;
             continue;
           }
           const finalByte = pending[i + 2];
@@ -293,7 +291,7 @@ export function createKeyDecoder(): KeyDecoder {
       return decodeBuffer(false);
     },
     hasPendingEscape(): boolean {
-      return pending.length === 1 && pending[0] === 0x1b;
+      return pending.length > 0 && pending[0] === 0x1b;
     },
     flush(): readonly KeyEvent[] {
       return decodeBuffer(true);
@@ -311,10 +309,25 @@ export function parseKeyBytes(chunk: Uint8Array): readonly KeyEvent[] {
   return flushed.length === 0 ? initial : [...initial, ...flushed];
 }
 
-const ANSI_ESCAPE_RE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])/g;
+const ANSI_ESCAPE_RE =
+  /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[P^_X][^\x07\x1b]*(?:\x07|\x1b\\)|[ -/]+[@-~]|[@-Z\\-_])|\x9b[0-?]*[ -/]*[@-~]/g;
 
 export function stripAnsi(text: string): string {
   return text.replace(ANSI_ESCAPE_RE, "");
+}
+
+export function sanitizeInlineText(text: string): string {
+  return stripAnsi(text)
+    .replaceAll("\x1b", "")
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
+    .replace(/ {2,}/g, " ")
+    .trim();
+}
+
+export function sanitizeInputText(text: string): string {
+  return stripAnsi(text)
+    .replaceAll("\x1b", "")
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, "");
 }
 
 function isZeroWidthCodePoint(cp: number): boolean {
@@ -407,19 +420,52 @@ function isWideCodePoint(cp: number): boolean {
   );
 }
 
-export function charDisplayWidth(ch: string): number {
-  const cp = ch.codePointAt(0);
-  if (cp === undefined || isZeroWidthCodePoint(cp)) {
+const GRAPHEME_SEGMENTER = new Intl.Segmenter("en", { granularity: "grapheme" });
+const EMOJI_PRESENTATION_RE = /\p{Emoji_Presentation}/u;
+const EXTENDED_PICTOGRAPHIC_RE = /\p{Extended_Pictographic}/u;
+
+export function splitGraphemes(text: string): readonly string[] {
+  const out: string[] = [];
+  for (const { segment } of GRAPHEME_SEGMENTER.segment(text)) {
+    out.push(segment);
+  }
+  return out;
+}
+
+export function graphemeDisplayWidth(grapheme: string): number {
+  if (grapheme.length === 0) {
     return 0;
   }
-  return isWideCodePoint(cp) ? 2 : 1;
+  let firstVisibleCp: number | undefined;
+  for (const ch of grapheme) {
+    const cp = ch.codePointAt(0);
+    if (cp !== undefined && !isZeroWidthCodePoint(cp)) {
+      firstVisibleCp = cp;
+      break;
+    }
+  }
+  if (firstVisibleCp === undefined) {
+    return 0;
+  }
+  if (
+    (!grapheme.includes("\uFE0E") && EMOJI_PRESENTATION_RE.test(grapheme)) ||
+    (grapheme.includes("\uFE0F") &&
+      (EXTENDED_PICTOGRAPHIC_RE.test(grapheme) || grapheme.includes("\u20E3")))
+  ) {
+    return 2;
+  }
+  return isWideCodePoint(firstVisibleCp) ? 2 : 1;
+}
+
+export function charDisplayWidth(ch: string): number {
+  return graphemeDisplayWidth(ch);
 }
 
 export function displayWidth(text: string): number {
   const plain = stripAnsi(text);
   let width = 0;
-  for (const ch of plain) {
-    width += charDisplayWidth(ch);
+  for (const { segment } of GRAPHEME_SEGMENTER.segment(plain)) {
+    width += graphemeDisplayWidth(segment);
   }
   return width;
 }
@@ -438,8 +484,8 @@ function tokenizeAnsiSegments(text: string): readonly (
   while (match !== null) {
     if (match.index > lastIndex) {
       const plainChunk = text.slice(lastIndex, match.index);
-      for (const ch of plainChunk) {
-        tokens.push({ kind: "char", ch, width: charDisplayWidth(ch) });
+      for (const { segment } of GRAPHEME_SEGMENTER.segment(plainChunk)) {
+        tokens.push({ kind: "char", ch: segment, width: graphemeDisplayWidth(segment) });
       }
     }
     tokens.push({ kind: "ansi", raw: match[0] });
@@ -448,8 +494,8 @@ function tokenizeAnsiSegments(text: string): readonly (
   }
   if (lastIndex < text.length) {
     const tail = text.slice(lastIndex);
-    for (const ch of tail) {
-      tokens.push({ kind: "char", ch, width: charDisplayWidth(ch) });
+    for (const { segment } of GRAPHEME_SEGMENTER.segment(tail)) {
+      tokens.push({ kind: "char", ch: segment, width: graphemeDisplayWidth(segment) });
     }
   }
   return tokens;
@@ -534,15 +580,18 @@ export function overlaySegmentOnLine(
   let right = "";
   let col = 0;
 
-  for (const ch of plainBg) {
-    const w = charDisplayWidth(ch);
+  for (const { segment: grapheme } of GRAPHEME_SEGMENTER.segment(plainBg)) {
+    const w = graphemeDisplayWidth(grapheme);
+    if (w === 0) {
+      continue;
+    }
     const nextCol = col + w;
     if (nextCol <= startCol) {
-      left += ch;
+      left += grapheme;
     } else if (col < startCol && nextCol > startCol) {
       left += " ".repeat(startCol - col);
     } else if (col >= endCol && nextCol <= totalCols) {
-      right += ch;
+      right += grapheme;
     } else if (col < endCol && nextCol > endCol) {
       right += " ".repeat(Math.min(nextCol, totalCols) - endCol);
     }
@@ -570,12 +619,12 @@ export function wrapText(text: string, maxWidth: number): readonly string[] {
   const lines: string[] = [];
 
   for (const paragraph of normalized.split("\n")) {
-    const trimmed = paragraph.trim();
-    if (trimmed.length === 0) {
+    const cleaned = sanitizeInlineText(paragraph);
+    if (cleaned.length === 0) {
       lines.push("");
       continue;
     }
-    const words = trimmed.split(/\s+/);
+    const words = cleaned.split(/\s+/);
     let current = "";
     for (const word of words) {
       if (current.length === 0) {

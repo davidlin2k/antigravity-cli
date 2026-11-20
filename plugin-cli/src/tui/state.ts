@@ -29,6 +29,7 @@ import type {
   UpdateReport,
 } from "../engine/contract.ts";
 import type { EngineResult } from "../domain/types.ts";
+import { sanitizeInputText, splitGraphemes } from "./ansi.ts";
 import type { KeyEvent } from "./ansi.ts";
 
 export const TAB_IDS = ["discover", "installed", "marketplaces", "errors", "stats"] as const;
@@ -114,16 +115,19 @@ export type OverlayState =
       readonly entryId: CatalogEntryId;
       readonly targetScope: InstallScope;
       readonly focusedButton: "primary" | "scope" | "close";
+      readonly pendingRequestId?: RequestId;
     }
   | {
       readonly kind: "installed-detail";
       readonly pluginId: InstalledPluginId;
       readonly focusedAction: "toggle" | "update" | "uninstall" | "close";
+      readonly pendingRequestId?: RequestId;
     }
   | {
       readonly kind: "marketplace-detail";
       readonly marketplaceId: MarketplaceId;
       readonly focusedAction: "update" | "remove" | "close";
+      readonly pendingRequestId?: RequestId;
     }
   | {
       readonly kind: "add-marketplace";
@@ -131,11 +135,13 @@ export type OverlayState =
       readonly idInput: TextInputState;
       readonly focusedField: "source" | "id" | "submit" | "cancel";
       readonly preview: AddMarketplacePreview;
+      readonly pendingRequestId?: RequestId;
     }
   | {
       readonly kind: "diagnostic-detail";
       readonly diagnosticId: DiagnosticId;
       readonly focusedAction: "fix" | "close";
+      readonly pendingRequestId?: RequestId;
     }
   | {
       readonly kind: "confirm";
@@ -281,15 +287,20 @@ export function reduceTextInput(
   input: TextInputState,
   key: KeyEvent,
 ): { readonly next: TextInputState; readonly handled: boolean } {
-  const chars = Array.from(input.value);
-  const cursor = Math.max(0, Math.min(chars.length, input.cursor));
+  const graphemes = splitGraphemes(input.value);
+  const cursor = Math.max(0, Math.min(graphemes.length, input.cursor));
 
   switch (key.kind) {
     case "char": {
-      const inserted = Array.from(key.ch);
-      const nextChars = [...chars.slice(0, cursor), ...inserted, ...chars.slice(cursor)];
+      const safeCh = sanitizeInputText(key.ch);
+      if (safeCh.length === 0) {
+        return { next: input, handled: true };
+      }
+      const prefix = graphemes.slice(0, cursor).join("");
+      const suffix = graphemes.slice(cursor).join("");
+      const nextPrefix = `${prefix}${safeCh}`;
       return {
-        next: { value: nextChars.join(""), cursor: cursor + inserted.length },
+        next: { value: `${nextPrefix}${suffix}`, cursor: splitGraphemes(nextPrefix).length },
         handled: true,
       };
     }
@@ -297,19 +308,19 @@ export function reduceTextInput(
       if (cursor === 0) {
         return { next: input, handled: true };
       }
-      const nextChars = [...chars.slice(0, cursor - 1), ...chars.slice(cursor)];
+      const nextGraphemes = [...graphemes.slice(0, cursor - 1), ...graphemes.slice(cursor)];
       return {
-        next: { value: nextChars.join(""), cursor: cursor - 1 },
+        next: { value: nextGraphemes.join(""), cursor: cursor - 1 },
         handled: true,
       };
     }
     case "delete": {
-      if (cursor >= chars.length) {
+      if (cursor >= graphemes.length) {
         return { next: input, handled: true };
       }
-      const nextChars = [...chars.slice(0, cursor), ...chars.slice(cursor + 1)];
+      const nextGraphemes = [...graphemes.slice(0, cursor), ...graphemes.slice(cursor + 1)];
       return {
-        next: { value: nextChars.join(""), cursor },
+        next: { value: nextGraphemes.join(""), cursor },
         handled: true,
       };
     }
@@ -320,27 +331,27 @@ export function reduceTextInput(
       };
     case "right":
       return {
-        next: { value: input.value, cursor: Math.min(chars.length, cursor + 1) },
+        next: { value: input.value, cursor: Math.min(graphemes.length, cursor + 1) },
         handled: true,
       };
     case "home":
       return { next: { value: input.value, cursor: 0 }, handled: true };
     case "end":
-      return { next: { value: input.value, cursor: chars.length }, handled: true };
+      return { next: { value: input.value, cursor: graphemes.length }, handled: true };
     case "ctrl-u": {
-      const nextChars = chars.slice(cursor);
-      return { next: { value: nextChars.join(""), cursor: 0 }, handled: true };
+      const nextGraphemes = graphemes.slice(cursor);
+      return { next: { value: nextGraphemes.join(""), cursor: 0 }, handled: true };
     }
     case "ctrl-w": {
       let cut = cursor;
-      while (cut > 0 && /\s/.test(chars[cut - 1] ?? "")) {
+      while (cut > 0 && /\s/.test(graphemes[cut - 1] ?? "")) {
         cut -= 1;
       }
-      while (cut > 0 && !/\s/.test(chars[cut - 1] ?? "")) {
+      while (cut > 0 && !/\s/.test(graphemes[cut - 1] ?? "")) {
         cut -= 1;
       }
-      const nextChars = [...chars.slice(0, cut), ...chars.slice(cursor)];
-      return { next: { value: nextChars.join(""), cursor: cut }, handled: true };
+      const nextGraphemes = [...graphemes.slice(0, cut), ...graphemes.slice(cursor)];
+      return { next: { value: nextGraphemes.join(""), cursor: cut }, handled: true };
     }
     default:
       return { next: input, handled: false };

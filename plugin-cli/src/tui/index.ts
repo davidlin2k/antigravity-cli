@@ -240,6 +240,16 @@ export async function runTui(
     paint();
   }
 
+  function flushPendingEscape(): void {
+    escapeTimer = null;
+    for (const key of keyDecoder.flush()) {
+      dispatch({ kind: "key", key });
+      if (closed) {
+        return;
+      }
+    }
+  }
+
   terminal.enterRawAltScreen();
   const stopData = terminal.onData((chunk) => {
     if (escapeTimer !== null) {
@@ -254,15 +264,7 @@ export async function runTui(
       }
     }
     if (keyDecoder.hasPendingEscape()) {
-      escapeTimer = setTimeout(() => {
-        escapeTimer = null;
-        for (const key of keyDecoder.flush()) {
-          dispatch({ kind: "key", key });
-          if (closed) {
-            return;
-          }
-        }
-      }, escapeFlushMs);
+      escapeTimer = setTimeout(flushPendingEscape, escapeFlushMs);
     }
   });
 

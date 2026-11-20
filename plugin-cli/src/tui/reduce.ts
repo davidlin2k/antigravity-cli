@@ -13,6 +13,7 @@ import type {
   InstalledPlugin,
   InstallScope,
   MarketplaceId,
+  RequestId,
   WorkspaceSnapshot,
 } from "../domain/types.ts";
 import type { KeyEvent } from "./ansi.ts";
@@ -110,13 +111,34 @@ export function findInstalledForEntryInScope(
   entry: CatalogEntry,
   scope: InstallScope,
 ): InstalledPlugin | undefined {
+  for (const plugin of snapshot.installed) {
+    if (
+      plugin.scope === scope &&
+      plugin.provenance.kind === "marketplace" &&
+      plugin.provenance.entryId === entry.id
+    ) {
+      return plugin;
+    }
+  }
+  return undefined;
+}
+
+export function findSameNameCollisionInScope(
+  snapshot: WorkspaceSnapshot,
+  entry: CatalogEntry,
+  scope: InstallScope,
+): InstalledPlugin | undefined {
   const ids = snapshot.installedIdsByPluginName.get(entry.name);
   if (ids === undefined) {
     return undefined;
   }
   for (const id of ids) {
     const plugin = snapshot.installedById.get(id);
-    if (plugin !== undefined && plugin.scope === scope) {
+    if (
+      plugin !== undefined &&
+      plugin.scope === scope &&
+      !(plugin.provenance.kind === "marketplace" && plugin.provenance.entryId === entry.id)
+    ) {
       return plugin;
     }
   }
@@ -222,6 +244,68 @@ export function resolveActiveSelectedIndex(
   }
 }
 
+function attachOverlayRequestId(overlay: OverlayState, requestId: RequestId): OverlayState {
+  switch (overlay.kind) {
+    case "discover-detail":
+    case "installed-detail":
+    case "marketplace-detail":
+    case "add-marketplace":
+    case "diagnostic-detail":
+      return { ...overlay, pendingRequestId: requestId };
+    case "none":
+    case "search-input":
+    case "confirm":
+    case "help":
+      return overlay;
+    default: {
+      const _exhaustive: never = overlay;
+      return _exhaustive;
+    }
+  }
+}
+
+function hasMatchingOverlayRequestId(overlay: OverlayState, requestId: RequestId): boolean {
+  switch (overlay.kind) {
+    case "discover-detail":
+    case "installed-detail":
+    case "marketplace-detail":
+    case "add-marketplace":
+    case "diagnostic-detail":
+      return overlay.pendingRequestId === requestId;
+    case "none":
+    case "search-input":
+    case "confirm":
+    case "help":
+      return false;
+    default: {
+      const _exhaustive: never = overlay;
+      return _exhaustive;
+    }
+  }
+}
+
+function clearOverlayRequestId(overlay: OverlayState, requestId: RequestId): OverlayState {
+  switch (overlay.kind) {
+    case "discover-detail":
+    case "installed-detail":
+    case "marketplace-detail":
+    case "add-marketplace":
+    case "diagnostic-detail":
+      return overlay.pendingRequestId === requestId
+        ? { ...overlay, pendingRequestId: undefined }
+        : overlay;
+    case "none":
+    case "search-input":
+    case "confirm":
+    case "help":
+      return overlay;
+    default: {
+      const _exhaustive: never = overlay;
+      return _exhaustive;
+    }
+  }
+}
+
 function startMutation(
   state: TuiState,
   mutation: PendingMutationSpec,
@@ -231,9 +315,10 @@ function startMutation(
     return [withToast(state, "warning", `Busy: ${state.pending.label}`), []];
   }
   const requestId = state.nextRequestId;
+  const targetOverlay = nextOverlay ?? attachOverlayRequestId(state.overlay, requestId);
   const nextState: TuiState = {
     ...state,
-    overlay: nextOverlay ?? state.overlay,
+    overlay: targetOverlay,
     pending: { kind: "running", requestId, label: mutation.label },
     nextRequestId: nextRequestId(requestId),
     spinnerTick: 0,
@@ -741,11 +826,29 @@ function reduceKey(
           overlay.targetScope,
         );
         if (installedInScope !== undefined) {
-          return startMutation(state, {
-            kind: "uninstall",
-            input: { selector: { kind: "id", id: installedInScope.id } },
-            label: `Uninstalling ${installedInScope.id}`,
-          });
+          const name =
+            installedInScope.kind === "valid"
+              ? installedInScope.manifest.name
+              : installedInScope.dirName;
+          return [
+            {
+              ...state,
+              overlay: {
+                kind: "confirm",
+                title: "Uninstall plugin",
+                message: `Remove "${name}" (${installedInScope.id}) from ${installedInScope.installPath}?`,
+                confirmLabel: "Uninstall",
+                mutation: {
+                  kind: "uninstall",
+                  input: { selector: { kind: "id", id: installedInScope.id } },
+                  label: `Uninstalling ${installedInScope.id}`,
+                },
+                returnOverlay: overlay,
+                focusedChoice: "cancel",
+              },
+            },
+            [],
+          ];
         }
         return startMutation(state, {
           kind: "install",
@@ -1127,14 +1230,25 @@ export function reduce(
       const clearsPending =
         state.pending.kind === "running" && state.pending.requestId === event.requestId;
       const summary = summarizeMutationOutcome(event.outcome);
+      const overlayInitiated = hasMatchingOverlayRequestId(state.overlay, event.requestId);
 
       let nextOverlay = state.overlay;
       if (event.outcome.result.ok) {
         if (
-          state.overlay.kind === "add-marketplace" ||
-          state.overlay.kind === "discover-detail" ||
-          state.overlay.kind === "diagnostic-detail" ||
-          state.overlay.kind === "confirm"
+          state.overlay.kind === "add-marketplace" &&
+          overlayInitiated
+        ) {
+          nextOverlay = { kind: "none" };
+        } else if (
+          state.overlay.kind === "discover-detail" &&
+          (overlayInitiated ||
+            resultSnapshot.catalogById.get(state.overlay.entryId) === undefined)
+        ) {
+          nextOverlay = { kind: "none" };
+        } else if (
+          state.overlay.kind === "diagnostic-detail" &&
+          (overlayInitiated ||
+            resultSnapshot.diagnosticsById.get(state.overlay.diagnosticId) === undefined)
         ) {
           nextOverlay = { kind: "none" };
         } else if (
@@ -1147,7 +1261,11 @@ export function reduce(
           resultSnapshot.marketplacesById.get(state.overlay.marketplaceId) === undefined
         ) {
           nextOverlay = { kind: "none" };
+        } else {
+          nextOverlay = clearOverlayRequestId(state.overlay, event.requestId);
         }
+      } else {
+        nextOverlay = clearOverlayRequestId(state.overlay, event.requestId);
       }
 
       const nextState: TuiState = {
@@ -1203,13 +1321,16 @@ export function computeFooterHints(
         { keys: "Enter", label: "run focused action" },
         { keys: "Esc", label: "back" },
       ];
-    case "installed-detail":
-      return [
-        { keys: "Tab/←/→", label: "focus action" },
-        { keys: "Space", label: "toggle" },
-        { keys: "Enter", label: "run focused action" },
-        { keys: "Esc", label: "back" },
-      ];
+    case "installed-detail": {
+      const plugin = state.snapshot.installedById.get(overlay.pluginId);
+      const hints: KeyHint[] = [{ keys: "Tab/←/→", label: "focus action" }];
+      if (plugin?.kind === "valid") {
+        hints.push({ keys: "Space", label: "toggle" });
+      }
+      hints.push({ keys: "Enter", label: "run focused action" });
+      hints.push({ keys: "Esc", label: "back" });
+      return hints;
+    }
     case "marketplace-detail":
       return [
         { keys: "Tab/←/→", label: "focus action" },
