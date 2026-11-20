@@ -60,9 +60,6 @@ async function executeMutation(
   }
 }
 
-/**
- * Runs the interactive 5-tab TUI loop against a PluginEngine and TerminalPort.
- */
 export async function runTui(
   engine: PluginEngine,
   terminal: TerminalPort,
@@ -195,7 +192,6 @@ export async function runTui(
             try {
               latestSnapshot = await engine.snapshot();
             } catch {
-              // Keep current snapshot when recovery read also fails.
             }
             dispatch({
               kind: "mutation-finished",

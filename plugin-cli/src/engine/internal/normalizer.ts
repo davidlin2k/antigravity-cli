@@ -398,10 +398,6 @@ function extractJsonErrorPosition(
   return lineColAtOffset(cleaned, locateJsonSyntaxError(cleaned));
 }
 
-/**
- * Parses UTF-8 JSONC safely, stripping an optional UTF-8 BOM, line/block comments,
- * and trailing commas while preserving exact 1-based line and column positions on error.
- */
 export function parseJsoncBomSafe(
   rawBytes: Uint8Array | string,
   _filePath?: AbsolutePath,
@@ -635,11 +631,6 @@ function extractStringArray(raw: unknown): string[] {
   return out;
 }
 
-/**
- * Strictly whitelists Antigravity's valid top-level `plugin.json` fields and extracts
- * cross-ecosystem metadata (category, tags, inline MCP servers, custom hook/MCP paths)
- * separately so unknown keys are never persisted to Antigravity's root `plugin.json`.
- */
 export function normalizeAntigravityManifest(
   rawObj: unknown,
   fallbackDirName?: string,
@@ -1570,10 +1561,6 @@ async function resolveMarketplacePluginSource(input: {
   }
 }
 
-/**
- * Parses and normalizes either Claude's `plugin-directory-cache-v2.json` (`listings[]`)
- * or a standard Antigravity/Claude/Cursor marketplace JSON file (`plugins[]`).
- */
 export async function normalizeJsonCatalog(
   marketplaceId: MarketplaceId,
   filePath: AbsolutePath,
@@ -1965,10 +1952,6 @@ function buildMarketplacePathTraversalResult(
   };
 }
 
-/**
- * Probes a local directory or cloned git mirror for an Antigravity, Claude, or Cursor
- * marketplace manifest, falling back to single-plugin mode when only a `plugin.json` exists.
- */
 export async function normalizeMarketplaceRoot(
   marketplaceId: MarketplaceId,
   rootDir: AbsolutePath,

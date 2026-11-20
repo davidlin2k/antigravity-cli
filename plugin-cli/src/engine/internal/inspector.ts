@@ -342,10 +342,6 @@ async function scanRulesDir(
   }
 }
 
-/**
- * Single authoritative directory inspector shared by pre-swap validation, `engine.validate()`,
- * and read-only `snapshot()` projection. Performs zero filesystem writes.
- */
 export async function inspectPluginDirectory(
   options: InspectPluginOptions,
 ): Promise<PluginInspectionResult> {

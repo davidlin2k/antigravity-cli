@@ -144,10 +144,6 @@ function computeUpdateAvailable(
   return null;
 }
 
-/**
- * Strictly read-only projection of the entire plugin workspace from disk and per-marketplace
- * sync caches. Never creates, modifies, or deletes any file or directory.
- */
 export async function projectWorkspaceSnapshot(
   paths: WorkspacePaths,
   revision: SnapshotRevision,
@@ -398,7 +394,6 @@ export async function projectWorkspaceSnapshot(
   }
 
   for (const [pluginName, group] of enabledByName.entries()) {
-    // Project scope always overrides user scope; ascending code-unit dirName breaks ties within a scope.
     group.sort((a, b) => {
       if (a.scope !== b.scope) {
         return a.scope === "project" ? -1 : 1;

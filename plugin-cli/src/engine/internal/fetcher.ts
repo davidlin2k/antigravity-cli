@@ -102,10 +102,6 @@ export async function isBareGitRepo(dirPath: AbsolutePath): Promise<boolean> {
   }
 }
 
-/**
- * Resolves an `https-auto` marketplace input once at `addMarketplace` into either
- * `https-git` (when `git ls-remote` succeeds) or `https-json` (when HTTP returns JSON).
- */
 export async function resolveMarketplaceSource(
   input: ParsedMarketplaceInput,
   timeoutMs: number = DEFAULT_NETWORK_TIMEOUT_MS,
@@ -208,7 +204,6 @@ async function cloneOrUpdateGitMirror(input: {
 
     let cloned = await runGit(cloneArgs, { timeoutMs });
     if (!cloned.ok && ref !== undefined) {
-      // Fallback when `ref` is a commit SHA or tag unsupported by `--branch`.
       await fs.rm(mirrorDir, { recursive: true, force: true }).catch(() => {});
       cloned = await runGit(["clone", "--", remoteUrl, mirrorDir], { timeoutMs });
       if (cloned.ok) {
@@ -353,10 +348,6 @@ async function persistSyncFailure(input: {
   };
 }
 
-/**
- * Syncs one marketplace into its isolated `cache/sync/<marketplaceId>.json` file.
- * Preserves last known good catalog entries if the sync fails.
- */
 export async function syncSingleMarketplace(
   paths: WorkspacePaths,
   entry: KnownMarketplaceEntry,

@@ -139,7 +139,6 @@ export async function resolvePossiblyDanglingTarget(
             cur = await resolveStep(cur, nestedLink, hops + 1);
             continue;
           } catch {
-            // Non-existent literal segment; keep lexical path for subsequent `..` resolution.
           }
         }
         cur = next;
@@ -346,12 +345,12 @@ async function isLockStale(lockFilePath: AbsolutePath, staleMs: number): Promise
       if (createdAt !== null && Date.now() - createdAt > staleMs) {
         return true;
       }
+      return false;
     }
-  } catch {
-    // A brand-new lockfile may still be mid-write; only reclaim corrupt locks past staleMs.
-    return ageByMtime > staleMs;
+    return true;
+  } catch (err) {
+    return getErrnoCode(err) === "ENOENT" || err instanceof SyntaxError;
   }
-  return false;
 }
 
 export async function withTargetLock<T>(
@@ -369,38 +368,43 @@ export async function withTargetLock<T>(
 
   await fs.mkdir(path.dirname(lockFilePath), { recursive: true });
 
+  const tmpLockPath = `${lockFilePath}.tmp-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
   let acquired = false;
-  for (let attempt = 0; attempt <= retries; attempt += 1) {
-    let handle: fs.FileHandle | null = null;
+  try {
+    const payload = JSON.stringify({ pid: process.pid, createdAt: Date.now() });
+    const handle = await fs.open(
+      tmpLockPath,
+      fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
+      0o600,
+    );
     try {
-      handle = await fs.open(
-        lockFilePath,
-        fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
-        0o600,
-      );
-      const payload = JSON.stringify({ pid: process.pid, createdAt: Date.now() });
       await handle.writeFile(payload, "utf8");
       await handle.sync();
+    } finally {
       await handle.close();
-      handle = null;
-      acquired = true;
-      break;
-    } catch (err) {
-      if (handle !== null) {
-        await handle.close().catch(() => {});
-      }
-      if (getErrnoCode(err) !== "EEXIST") {
-        throw err;
-      }
-      const stale = await isLockStale(lockFilePath, staleMs);
-      if (stale) {
-        await fs.rm(lockFilePath, { force: true }).catch(() => {});
-        continue;
-      }
-      if (attempt < retries) {
-        await sleep(retryDelayMs * (attempt + 1));
+    }
+
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+      try {
+        await fs.link(tmpLockPath, lockFilePath);
+        acquired = true;
+        break;
+      } catch (err) {
+        if (getErrnoCode(err) !== "EEXIST") {
+          throw err;
+        }
+        const stale = await isLockStale(lockFilePath, staleMs);
+        if (stale) {
+          await fs.rm(lockFilePath, { force: true }).catch(() => {});
+          continue;
+        }
+        if (attempt < retries) {
+          await sleep(retryDelayMs * (attempt + 1));
+        }
       }
     }
+  } finally {
+    await fs.rm(tmpLockPath, { force: true }).catch(() => {});
   }
 
   if (!acquired) {
@@ -1267,9 +1271,6 @@ async function isLockHeldByLiveProcess(lockFilePath: AbsolutePath): Promise<bool
   return !(await isLockStale(lockFilePath, DEFAULT_LOCK_STALE_MS));
 }
 
-/**
- * Strictly read-only scan for stale `.agy-stage-*` and `.agy-backup-*` entries inside a scope root.
- */
 export async function listStaleStagingPaths(
   scopeRoot: AbsolutePath,
   scope: InstallScope,
@@ -1313,10 +1314,6 @@ async function pathExists(targetPath: string): Promise<boolean> {
   }
 }
 
-/**
- * Recovers missing target directories from `.agy-backup-*` artifacts and removes stale
- * `.agy-stage-*` and redundant `.agy-backup-*` entries. Called only on mutations or remediation.
- */
 export async function recoverAndCleanStagingArtifacts(
   scopeRoot: AbsolutePath,
   scope: InstallScope,
@@ -1348,7 +1345,6 @@ export async function recoverAndCleanStagingArtifacts(
           removedPaths.push(artifact.path);
           continue;
         } catch {
-          // Fall through to removal only if rename failed because target appeared concurrently.
           if (!(await pathExists(targetPath))) {
             continue;
           }

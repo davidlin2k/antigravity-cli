@@ -68,7 +68,6 @@ export function readCliVersion(): string {
       return parsed.version;
     }
   } catch {
-    // Fall back to static package version when package.json cannot be read.
   }
   return "0.1.0";
 }

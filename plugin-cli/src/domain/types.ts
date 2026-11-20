@@ -83,8 +83,8 @@ const CONTROL_CHAR_RE = /[\u0000-\u001f\u007f]/;
 const WHITESPACE_RE = /\s/;
 const WINDOWS_DRIVE_RE = /^[a-zA-Z]:/;
 const MARKETPLACE_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
-// First char must be alphanumeric so `.`, `..`, and `.agy-*` internal staging/backup dirs cannot be valid plugin dir names.
 const PLUGIN_DIR_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
+export const RESERVED_INTERNAL_DIR_PREFIX = ".agy-";
 const ISO_TIMESTAMP_RE =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|([+-])(\d{2}):(\d{2}))$/;
 const SCP_SSH_GIT_RE =
@@ -247,7 +247,7 @@ export function makePluginName(raw: string): PluginName {
 }
 
 export function isPluginDirName(value: string): value is PluginDirName {
-  return PLUGIN_DIR_NAME_RE.test(value);
+  return !value.startsWith(RESERVED_INTERNAL_DIR_PREFIX) && PLUGIN_DIR_NAME_RE.test(value);
 }
 
 export function parsePluginDirName(raw: string): ParseResult<PluginDirName> {
@@ -682,9 +682,6 @@ export type ParsedMarketplaceInput =
       readonly subdir?: RelativeSubpath;
     };
 
-/**
- * Concrete source from which an individual plugin bundle can be materialized.
- */
 export type PluginInstallSource =
   | {
       readonly kind: "marketplace-root";

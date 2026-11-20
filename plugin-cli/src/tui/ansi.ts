@@ -299,9 +299,6 @@ export function createKeyDecoder(): KeyDecoder {
   };
 }
 
-/**
- * Decodes a single complete chunk of raw TTY bytes into KeyEvent values.
- */
 export function parseKeyBytes(chunk: Uint8Array): readonly KeyEvent[] {
   const decoder = createKeyDecoder();
   const initial = decoder.push(chunk);

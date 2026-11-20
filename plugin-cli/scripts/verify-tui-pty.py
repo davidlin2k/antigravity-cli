@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""End-to-end PTY verification lever for agy-plugin CLI and interactive TUI."""
 
 from __future__ import annotations
 
@@ -27,8 +26,6 @@ OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
 
 
 class VirtualScreen:
-    """Minimal ANSI screen grid supporting cursor positioning, SGR stripping, and line erase."""
-
     def __init__(self, cols: int, rows: int) -> None:
         self.cols = cols
         self.rows = rows
@@ -231,14 +228,12 @@ def main() -> int:
         res_inst = run_cli(["install", "pstack@cursor-plugins", "--scope", "user"], config_dir, workspace_dir)
         assert res_inst["ok"] is True, f"install pstack failed: {res_inst}"
 
-        # Seed a project-scope plugin with colliding name to populate Errors tab
         collide_dir = workspace_dir / ".agents" / "plugins" / "pstack-override"
         collide_dir.mkdir(parents=True)
         (collide_dir / "plugin.json").write_text(
             json.dumps({"name": "pstack", "version": "0.1.0", "description": "Local collision fixture"})
         )
 
-        # Spawn interactive TUI in real Linux PTY (120x36)
         master_fd, slave_fd = pty.openpty()
         set_winsize(slave_fd, 120, 36)
         env = os.environ.copy()
@@ -277,13 +272,11 @@ def main() -> int:
             assert "Stats" in frames["1_discover_initial"], "Missing Stats tab"
             assert "Esc" in frames["1_discover_initial"], "Missing Esc footer hint"
 
-            # Search for pstack live
             os.write(master_fd, b"/pstack")
             drain(master_fd, screen, 0.25)
             frames["2_discover_search"] = screen.render_text()
             assert "pstack" in frames["2_discover_search"], "Search did not show pstack"
 
-            # Apply search (Enter) then open Plugin Detail modal (Enter)
             os.write(master_fd, b"\r")
             drain(master_fd, screen, 0.2)
             os.write(master_fd, b"\r")
@@ -292,7 +285,6 @@ def main() -> int:
             assert "Plugin Details" in frames["3_discover_detail_modal"], "Plugin Details modal did not open"
             assert "pstack" in frames["3_discover_detail_modal"], "Plugin Details missing pstack"
 
-            # Close modal (Esc), switch right -> Installed
             os.write(master_fd, b"\x1b")
             drain(master_fd, screen, 0.2)
             os.write(master_fd, b"\x1b[C")
@@ -300,7 +292,6 @@ def main() -> int:
             frames["4_installed_tab"] = screen.render_text()
             assert "pstack" in frames["4_installed_tab"], "Installed tab missing pstack"
 
-            # Switch right -> Marketplaces, open Add Marketplace modal ('a'), type github shorthand
             os.write(master_fd, b"\x1b[C")
             drain(master_fd, screen, 0.25)
             frames["5_marketplaces_tab"] = screen.render_text()
@@ -314,7 +305,6 @@ def main() -> int:
             assert "Add Marketplace" in frames["6_add_marketplace_modal"], "Add Marketplace modal did not open"
             assert "github" in frames["6_add_marketplace_modal"].lower(), "Missing live github detection"
 
-            # Close modal (Esc), switch right -> Errors
             os.write(master_fd, b"\x1b")
             drain(master_fd, screen, 0.2)
             os.write(master_fd, b"\x1b[C")
@@ -322,7 +312,6 @@ def main() -> int:
             frames["7_errors_tab"] = screen.render_text()
             assert "name-collision" in frames["7_errors_tab"], "Errors tab missing name-collision diagnostic"
 
-            # Switch right -> Stats, cycle breakdown mode ('m')
             os.write(master_fd, b"\x1b[C")
             drain(master_fd, screen, 0.25)
             frames["8_stats_tab"] = screen.render_text()
@@ -334,7 +323,6 @@ def main() -> int:
             frames["9_stats_by_marketplace"] = screen.render_text()
             assert "By Marketplace" in frames["9_stats_by_marketplace"], "Stats mode cycle failed"
 
-            # Dynamic resize to 80x24
             screen.resize(80, 24)
             set_winsize(master_fd, 80, 24)
             os.kill(proc.pid, signal.SIGWINCH)
@@ -344,7 +332,6 @@ def main() -> int:
                 assert len("".join(line).rstrip()) <= 80, f"Row {idx} overflowed 80 cols"
             assert "Esc" in frames["10_resized_80x24"], "Footer lost Esc hint at 80x24"
 
-            # Exit via Esc
             os.write(master_fd, b"\x1b")
             drain(master_fd, screen, 0.35)
             exit_code = proc.wait(timeout=3)

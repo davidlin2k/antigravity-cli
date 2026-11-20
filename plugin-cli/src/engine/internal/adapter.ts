@@ -225,12 +225,6 @@ async function entryExists(targetPath: string): Promise<boolean> {
   }
 }
 
-/**
- * Stages a source bundle into `<scopeRoot>/.agy-stage-<dirName>-<nonce>`, normalizes
- * `plugin.json`, promotes/unwraps `hooks.json` and `mcp_config.json` with `${CLAUDE_PLUGIN_ROOT}`
- * and `${PLUGIN_ROOT}` expanded to the FINAL install path, validates with `inspector.ts`,
- * and swaps atomically on the same filesystem.
- */
 export async function adaptAndInstallBundle(
   input: AdaptInstallInput,
 ): Promise<AdaptInstallResult> {
